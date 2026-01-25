@@ -18,8 +18,11 @@ from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+    FlashInferTrtllmFp8MoeQuantInfo,
+)
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -76,11 +79,8 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher import (
-        CombineInput,
-        DispatchOutput,
-        StandardDispatchOutput,
-    )
+    from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 
@@ -443,12 +443,14 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale = layer.weight_scale
                     # If ROCm, normalize the weights and scales to e4m3fnuz
                     if _is_fp8_fnuz:
-                        weight, weight_scale, input_scale = (
-                            normalize_e4m3fn_to_e4m3fnuz(
-                                weight=weight,
-                                weight_scale=weight_scale,
-                                input_scale=layer.input_scale,
-                            )
+                        (
+                            weight,
+                            weight_scale,
+                            input_scale,
+                        ) = normalize_e4m3fn_to_e4m3fnuz(
+                            weight=weight,
+                            weight_scale=weight_scale,
+                            input_scale=layer.input_scale,
                         )
                         if input_scale is not None:
                             layer.input_scale = Parameter(
@@ -563,6 +565,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert is_sm100_supported() or is_sm90_supported()
+
+    @staticmethod
+    def is_deepgemm_moe_runner_backend_enabled() -> bool:
+        """Check if MoE will actually use DeepGEMM runner for FP8."""
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_deep_gemm():
+            return True
+        if moe_runner_backend.is_auto():
+            return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
+                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            )
+        return False
 
     def create_weights(
         self,
@@ -810,13 +827,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     should_deepgemm_weight_requant_ue8m0,
                 )
 
+                # Check if MoE will actually use DeepGEMM runner
+                will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
+
                 if (
                     should_deepgemm_weight_requant_ue8m0(
                         weight_block_size=getattr(
                             self.quant_config, "weight_block_size", None
                         ),
                     )
-                    and get_moe_runner_backend().is_deep_gemm()
+                    and will_use_deepgemm
                     and not layer.w13_weight_scale_inv.format_ue8m0
                 ):
                     assert isinstance(
@@ -850,12 +870,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             for expert in range(layer.num_local_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                )
+                (
+                    w13_weight[expert, :, :],
+                    layer.w13_weight_scale[expert],
+                ) = scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                (
+                    w2_weight[expert, :, :],
+                    layer.w2_weight_scale[expert],
+                ) = scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
@@ -893,15 +915,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if _is_fp8_fnuz:
                 # Normalize the weights and scales
-                w13_weight, w13_weight_scale, w13_input_scale = (
-                    normalize_e4m3fn_to_e4m3fnuz(
-                        layer.w13_weight, layer.w13_weight_scale, layer.w13_input_scale
-                    )
+                (
+                    w13_weight,
+                    w13_weight_scale,
+                    w13_input_scale,
+                ) = normalize_e4m3fn_to_e4m3fnuz(
+                    layer.w13_weight, layer.w13_weight_scale, layer.w13_input_scale
                 )
-                w2_weight, w2_weight_scale, w2_input_scale = (
-                    normalize_e4m3fn_to_e4m3fnuz(
-                        layer.w2_weight, layer.w2_weight_scale, layer.w2_input_scale
-                    )
+                (
+                    w2_weight,
+                    w2_weight_scale,
+                    w2_input_scale,
+                ) = normalize_e4m3fn_to_e4m3fnuz(
+                    layer.w2_weight, layer.w2_weight_scale, layer.w2_input_scale
                 )
                 # Reset the parameter
                 layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
@@ -947,83 +973,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
             if get_moe_runner_backend().is_flashinfer_trtllm():
-                from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_a
-
-                # Note: No need to swap W13 halves, they are already in the correct order: [Gate, Up]
-                num_experts, two_n, hidden = layer.w13_weight.shape
-
-                # 2) Reorder rows for fused gated activation (W13)
-                w13_interleaved = [
-                    reorder_rows_for_gated_act_gemm(layer.w13_weight[i])
-                    for i in range(num_experts)
-                ]
-                w13_interleaved = torch.stack(w13_interleaved).reshape(
-                    num_experts, two_n, hidden
+                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                    align_fp8_moe_weights_for_flashinfer_trtllm,
                 )
 
-                # 3) Shuffle weights for transposed MMA output (both W13, W2)
-                epilogue_tile_m = 128
-                w13_shuffled = [
-                    shuffle_matrix_a(
-                        w13_interleaved[i].view(torch.uint8), epilogue_tile_m
-                    )
-                    for i in range(num_experts)
-                ]
-                w2_shuffled = [
-                    shuffle_matrix_a(
-                        layer.w2_weight[i].view(torch.uint8), epilogue_tile_m
-                    )
-                    for i in range(num_experts)
-                ]
-
-                layer.w13_weight = Parameter(
-                    torch.stack(w13_shuffled).view(torch.float8_e4m3fn),
-                    requires_grad=False,
-                )
-                layer.w2_weight = Parameter(
-                    torch.stack(w2_shuffled).view(torch.float8_e4m3fn),
-                    requires_grad=False,
-                )
-
-                # Precompute and register per-expert output scaling factors for FI MoE
-                # Note: w13_input_scale and w2_input_scale are scalar Parameters post-reduction
-                assert (
-                    hasattr(layer, "w13_input_scale")
-                    and layer.w13_input_scale is not None
-                )
-                assert (
-                    hasattr(layer, "w2_input_scale")
-                    and layer.w2_input_scale is not None
-                )
-                assert (
-                    hasattr(layer, "w13_weight_scale")
-                    and layer.w13_weight_scale is not None
-                )
-                assert (
-                    hasattr(layer, "w2_weight_scale")
-                    and layer.w2_weight_scale is not None
-                )
-
-                input_scale = layer.w13_input_scale.to(torch.float32)
-                activation_scale = layer.w2_input_scale.to(torch.float32)
-                w13_weight_scale = layer.w13_weight_scale.to(torch.float32)
-                w2_weight_scale = layer.w2_weight_scale.to(torch.float32)
-
-                output1_scales_scalar = (
-                    w13_weight_scale * input_scale * (1.0 / activation_scale)
-                )
-                output1_scales_gate_scalar = w13_weight_scale * input_scale
-                output2_scales_scalar = activation_scale * w2_weight_scale
-
-                layer.output1_scales_scalar = Parameter(
-                    output1_scales_scalar, requires_grad=False
-                )
-                layer.output1_scales_gate_scalar = Parameter(
-                    output1_scales_gate_scalar, requires_grad=False
-                )
-                layer.output2_scales_scalar = Parameter(
-                    output2_scales_scalar, requires_grad=False
-                )
+                align_fp8_moe_weights_for_flashinfer_trtllm(layer)
             return
 
     def process_weights_hip_int4(self, layer: Module):
@@ -1105,21 +1059,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-
-        from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
-            ):
+            if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
-        if moe_runner_backend.is_deep_gemm() or moe_runner_backend.is_triton():
+        if (
+            moe_runner_backend.is_deep_gemm()
+            or moe_runner_backend.is_triton()
+            or moe_runner_backend.is_flashinfer_trtllm()
+        ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
@@ -1244,6 +1196,51 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
+            )
+        elif self.runner.runner_backend.is_flashinfer_trtllm():
+            # FlashInfer TRT-LLM backend only supports fused execution and consumes
+            # router logits directly (no separate apply_with_router_logits needed).
+            global_num_experts = int(getattr(layer, "num_experts"))
+            num_local_experts = int(getattr(layer, "num_local_experts"))
+            moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
+
+            quant_info = FlashInferTrtllmFp8MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                global_num_experts=global_num_experts,
+                local_expert_offset=moe_ep_rank * num_local_experts,
+                local_num_experts=num_local_experts,
+                routing_method_type=int(
+                    getattr(layer, "routing_method_type", RoutingMethodType.DeepSeekV3)
+                ),
+                block_quant=self.block_quant,
+                weight_block_k=(
+                    None
+                    if self.quant_config.weight_block_size is None
+                    else self.quant_config.weight_block_size[1]
+                ),
+                w13_weight_scale_inv=(
+                    layer.w13_weight_scale_inv if self.block_quant else None
+                ),
+                w2_weight_scale_inv=(
+                    layer.w2_weight_scale_inv if self.block_quant else None
+                ),
+                w13_input_scale=layer.w13_input_scale if not self.block_quant else None,
+                output1_scales_scalar=(
+                    getattr(layer, "output1_scales_scalar", None)
+                    if not self.block_quant
+                    else None
+                ),
+                output1_scales_gate_scalar=(
+                    getattr(layer, "output1_scales_gate_scalar", None)
+                    if not self.block_quant
+                    else None
+                ),
+                output2_scales_scalar=(
+                    getattr(layer, "output2_scales_scalar", None)
+                    if not self.block_quant
+                    else None
+                ),
             )
         elif self.runner.runner_backend.is_triton():
             quant_info = TritonMoeQuantInfo(
@@ -1395,7 +1392,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         if routed_scaling_factor is not None
                         else 1.0
                     ),
-                    tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
                     use_shuffled_weight=False,
                     tune_max_num_tokens=next_power_of_2(a_q.shape[0]),

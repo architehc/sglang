@@ -100,6 +100,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+from sglang.srt.logit_lens import LogitLensExtractor, create_logit_lens_extractor
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -148,6 +149,7 @@ from sglang.srt.utils import (
     get_local_ip_auto,
     init_custom_process_group,
     is_hip,
+    is_host_cpu_arm64,
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
@@ -178,6 +180,7 @@ from sglang.srt.weight_sync.tensor_bucket import (
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -483,6 +486,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
+
+        # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
+        loop_num = getattr(self.model_config.hf_config, "loop_num", 1)
+        if loop_num > 1:
+            self.num_effective_layers = self.num_effective_layers * loop_num
+
         assert (
             (not model_has_mtp_layers)
             or (self.spec_algorithm.is_none())
@@ -585,21 +594,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
     def init_routed_experts_capturer(self):
-        # TODO: the redundant logic with TpModelWorker
-        max_running_requests = min(
-            (
-                self.max_total_num_tokens // 2
-                if self.server_args.max_running_requests is None
-                else self.server_args.max_running_requests
-                // (
-                    self.server_args.dp_size
-                    if self.server_args.enable_dp_attention
-                    else 1
-                )
-            ),
-            self.req_to_token_pool.size,
-        )
-
         if not self.server_args.disable_shared_experts_fusion and hasattr(
             self.model, "num_fused_shared_experts"
         ):
@@ -613,7 +607,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
-                max_running_requests=max_running_requests,
+                max_running_requests=self.max_running_requests,
                 device=self.device,
             )
         )
@@ -744,7 +738,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not self.is_draft_worker:
             if self.device == "cpu":
-                if _is_cpu_amx_available:
+                if _is_cpu_amx_available or _is_cpu_arm64:
                     # Bind OpenMP threads to CPU cores
                     torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
@@ -758,7 +752,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                 else:
                     logger.warning(
-                        "init_cpu_threads_env and shared memory based AllReduce is disabled since intel amx backend is not available"
+                        "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
                     )
 
             # Only initialize the distributed environment on the target model worker.
@@ -775,7 +769,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
-                torch_compile=self.server_args.enable_piecewise_cuda_graph,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -969,6 +962,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.tp_size,
                 self.tp_rank,
                 self.pp_rank,
+            )
+
+        # Initialize logit lens extractor for interpretability (experimental)
+        self.logit_lens_extractor: Optional[LogitLensExtractor] = None
+        if hasattr(self.model, "lm_head"):
+            # Get final layer norm if available (for proper projection)
+            norm_module = None
+            if hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
+                norm_module = self.model.model.norm
+            elif hasattr(self.model, "norm"):
+                norm_module = self.model.norm
+
+            self.logit_lens_extractor = create_logit_lens_extractor(
+                model=self.model,
+                config=self.model_config.hf_config,
+                norm_module=norm_module,
+            )
+            logger.debug(
+                f"Initialized logit lens extractor for {self.model_config.num_hidden_layers} layers"
             )
 
         # Pre-expand RoPE cache before CUDA Graph capture
@@ -1447,6 +1459,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
+        return result
+
+    def load_lora_adapter_from_tensors(
+        self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
+    ):
+        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
+        result = self.lora_manager.load_lora_adapter_from_tensors(
+            lora_ref, tensors, config_dict, added_tokens_config
+        )
+        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
         return result
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
@@ -2169,6 +2191,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # In DP Attention, IDLE batches are padded (batch_size > 0) for MLP sync.
+        # in this case, we need to reinit the forward metadata, otherwise the stale
+        # metadata causes batch_size mismatch in attention kernel(e.g. NSA Indexer).
+        if forward_batch.batch_size > 0:
+            self.attn_backend.init_forward_metadata(forward_batch)
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -2221,7 +2249,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
-        output.expert_distribution_metrics = recorder_outputs.get("metrics")
+        output.expert_distribution_metrics = (
+            recorder_outputs.get("metrics") if recorder_outputs else None
+        )
 
         # Copy cached routing experts' buffers back to CPU cache
         get_global_experts_capturer().on_forward_end(
@@ -2261,6 +2291,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+        # Register logit lens hooks if requested (experimental interpretability feature)
+        logit_lens_active = False
+        if (
+            forward_batch.capture_logit_lens
+            and self.logit_lens_extractor is not None
+            and hasattr(self.model, "lm_head")
+        ):
+            self.logit_lens_extractor.register_hooks(forward_batch.logit_lens_layer_ids)
+            logit_lens_active = True
 
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
@@ -2307,6 +2347,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.pp_group.is_last_rank
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
+
+        # Compute logit lens output if hooks were active
+        if logit_lens_active and isinstance(ret, LogitsProcessorOutput):
+            try:
+                lens_output = self.logit_lens_extractor.compute_lens(
+                    lm_head=self.model.lm_head,
+                    top_k=forward_batch.logit_lens_top_k,
+                    final_logits=ret.next_token_logits,
+                )
+                ret.logit_lens_output = lens_output
+            finally:
+                # Always clean up hooks and captured states
+                self.logit_lens_extractor.remove_hooks()
+                self.logit_lens_extractor.clear()
 
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 

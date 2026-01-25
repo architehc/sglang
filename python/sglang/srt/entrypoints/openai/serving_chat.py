@@ -55,6 +55,32 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _extract_max_dynamic_patch(request: ChatCompletionRequest):
+    img_vals = []
+    vid_vals = []
+    for msg in request.messages or []:
+        content = getattr(msg, "content", None)
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            # pydantic object or dict type
+            if getattr(part, "type", None) == "image_url":
+                iu = getattr(part, "image_url", None)
+                mdp = getattr(iu, "max_dynamic_patch", None) if iu else None
+                if mdp is not None:
+                    img_vals.append(int(mdp))
+            elif getattr(part, "type", None) == "video_url":
+                vu = getattr(part, "video_url", None)
+                mdp = getattr(vu, "max_dynamic_patch", None) if vu else None
+                if mdp is not None:
+                    vid_vals.append(int(mdp))
+
+    # TODO(yuan-luo): per-item max_dynamic_patch for both image and video
+    img_max_dynamic_patch = min(img_vals) if img_vals else None
+    vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
+    return img_max_dynamic_patch, vid_max_dynamic_patch
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -195,6 +221,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if first_adapter:
                 self._validate_lora_enabled(first_adapter)
 
+        img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
+            request
+        )
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -213,12 +242,33 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
+            return_attention_tokens=request.return_attention_tokens,
+            top_k_attention=request.top_k_attention,
+            attention_capture_layer_id=request.attention_capture_layer_id,
+            attention_capture_layer_ids=request.attention_capture_layer_ids,
+            attention_sketch_mode=request.attention_sketch_mode,
+            attention_fingerprint_mode=request.attention_fingerprint_mode,
+            attention_fingerprint_only=request.attention_fingerprint_only,
+            attention_mask_prefix=request.attention_mask_prefix,
+            include_prompt_attention=request.include_prompt_attention,
+            attention_capture_head_ids=request.attention_capture_head_ids,
+            attention_biases=self._convert_attention_biases(request.attention_biases),
+            return_moe_routing=request.return_moe_routing,
+            moe_routing_top_k=request.moe_routing_top_k,
+            moe_capture_layer_ids=request.moe_capture_layer_ids,
+            return_logit_lens=request.return_logit_lens,
+            logit_lens_top_k=request.logit_lens_top_k,
+            logit_lens_layer_ids=request.logit_lens_layer_ids,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
+            routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            image_max_dynamic_patch=img_max_dynamic_patch,
+            video_max_dynamic_patch=vid_max_dynamic_patch,
+            max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
         )
 
         return adapted_request, request
@@ -515,6 +565,8 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        attention_tokens = {}
+        logit_lens_data = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -526,6 +578,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                attention_tokens[index] = content["meta_info"].get(
+                    "attention_tokens", None
+                )
+                logit_lens_data[index] = content["meta_info"].get("logit_lens", None)
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -707,6 +763,44 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
+            # Send attention tokens if requested (for interpretability)
+            if request.return_attention_tokens and attention_tokens:
+                for index, choice_attention_tokens in attention_tokens.items():
+                    if choice_attention_tokens:
+                        attention_tokens_chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            choices=[
+                                ChatCompletionResponseStreamChoice(
+                                    index=index,
+                                    delta=DeltaMessage(
+                                        attention_tokens=choice_attention_tokens
+                                    ),
+                                    finish_reason=None,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield f"data: {attention_tokens_chunk.model_dump_json()}\n\n"
+
+            # Send logit lens data if requested (for interpretability)
+            if request.return_logit_lens and logit_lens_data:
+                for index, choice_logit_lens in logit_lens_data.items():
+                    if choice_logit_lens:
+                        logit_lens_chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            choices=[
+                                ChatCompletionResponseStreamChoice(
+                                    index=index,
+                                    delta=DeltaMessage(logit_lens=choice_logit_lens),
+                                    finish_reason=None,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield f"data: {logit_lens_chunk.model_dump_json()}\n\n"
+
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
@@ -774,6 +868,16 @@ class OpenAIServingChat(OpenAIServingBase):
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
 
+            # Handle attention tokens (interpretability)
+            attention_tokens = None
+            if request.return_attention_tokens:
+                attention_tokens = ret_item["meta_info"].get("attention_tokens")
+
+            # Handle logit lens (interpretability)
+            logit_lens = None
+            if request.return_logit_lens:
+                logit_lens = ret_item["meta_info"].get("logit_lens")
+
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
 
@@ -832,6 +936,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                attention_tokens=attention_tokens,
+                logit_lens=logit_lens,
             )
             choices.append(choice_data)
 
@@ -1059,6 +1165,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_calls = getattr(msg, "tool_calls", None)
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
+
+    def _convert_attention_biases(
+        self, biases: Optional[Dict[str, Dict[str, float]]]
+    ) -> Optional[Dict[int, Dict[int, float]]]:
+        """Convert string-keyed attention biases from API to int-keyed internal format."""
+        if biases is None:
+            return None
+        return {
+            int(layer_id): {
+                int(token_pos): bias for token_pos, bias in token_biases.items()
+            }
+            for layer_id, token_biases in biases.items()
+        }
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Judge whether the request needs reasoning"""

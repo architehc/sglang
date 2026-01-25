@@ -103,6 +103,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
@@ -1062,6 +1063,21 @@ async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
         )
 
 
+@app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
+async def load_lora_adapter_from_tensors(
+    obj: LoadLoRAAdapterFromTensorsReqInput, request: Request
+):
+    """Load a new LoRA adapter from tensors without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
+        obj, request
+    )
+
+    if result.success:
+        return ORJSONResponse(result, status_code=HTTPStatus.OK)
+    else:
+        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.api_route("/unload_lora_adapter", methods=["POST"])
 async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
     """Load a new LoRA adapter without re-launching the server."""
@@ -1322,6 +1338,95 @@ async def retrieve_model(model: str):
     )
 
 
+@app.get("/v1/attention/capabilities", response_class=ORJSONResponse)
+async def attention_capabilities():
+    """
+    Returns attention capture capabilities and configuration.
+
+    Useful for clients to discover available modes, limits, and features
+    before making requests with attention capture enabled.
+    """
+    server_args = _global_state.tokenizer_manager.server_args
+    model_config = _global_state.tokenizer_manager.model_config
+
+    return {
+        "enabled": server_args.return_attention_tokens,
+        "modes": {
+            "raw": {
+                "available": True,
+                "description": "Full top-k attention positions and scores per token",
+                "bytes_per_token": "~200-500 (depends on layers)",
+            },
+            "sketch": {
+                "available": True,
+                "enabled_by_default": server_args.attention_sketch_mode,
+                "description": "Per-layer sketches with histograms and entropy",
+                "bytes_per_token": "~500 per layer",
+            },
+            "fingerprint": {
+                "available": True,
+                "enabled_by_default": server_args.attention_fingerprint_mode,
+                "description": "64-byte GPU-aggregated fingerprint for clustering",
+                "bytes_per_token": 64,
+            },
+        },
+        "limits": {
+            "max_top_k": 64,  # Reasonable upper bound
+            "default_top_k": server_args.attention_tokens_top_k,
+            "max_tokens": server_args.attention_tokens_max,
+            "stride": server_args.attention_tokens_stride,
+            "chunk_size": server_args.attention_chunk_size,
+            "fingerprint_max_steps": server_args.attention_fingerprint_max_steps,
+        },
+        "layers": {
+            "total": model_config.num_hidden_layers,
+            "capture_mode": server_args.attention_capture_layers,
+            "capture_layer_id": server_args.attention_capture_layer_id,
+        },
+        "features": {
+            "include_prompt_attention": True,
+            "privacy_mask": {
+                "enabled": server_args.attention_mask_prefix > 0
+                or server_args.attention_mask_system_prompt,
+                "mask_system_prompt": server_args.attention_mask_system_prompt,
+                "mask_prefix": server_args.attention_mask_prefix,
+            },
+            "head_selection": True,  # Filter which heads to average (attention_capture_head_ids param)
+            "attention_steering": True,  # attention_biases parameter
+            "logit_lens": {
+                "enabled": False,  # Experimental - API defined but not yet fully implemented
+                "description": "Project intermediate layer outputs to vocabulary space",
+                "status": "planned",  # Will show token prediction evolution through layers
+            },
+            "pca_loadings": {
+                "enabled": True,  # Client-side PCA loadings for fingerprint interpretation
+                "description": "Pre-defined principal components for fingerprint analysis",
+                "components": [
+                    {"name": "PC1: Local vs Long-Range", "variance": 0.35},
+                    {"name": "PC2: Focused vs Diffuse", "variance": 0.25},
+                    {"name": "PC3: Semantic Bridge", "variance": 0.15},
+                    {"name": "PC4: Structure Ripple", "variance": 0.10},
+                ],
+            },
+        },
+        "guardrails": {
+            "api_key_required": server_args.attention_capture_api_key is not None,
+            "allowed_origins": (
+                server_args.attention_capture_allowed_origins.split(",")
+                if server_args.attention_capture_allowed_origins
+                else None
+            ),
+            "max_concurrent": server_args.attention_capture_max_concurrent,
+            "disabled_in_production": server_args.attention_capture_disable_in_production,
+        },
+        "model": {
+            "name": _global_state.tokenizer_manager.served_model_name,
+            "context_length": model_config.context_len,
+            "num_heads": getattr(model_config, "num_attention_heads", None),
+        },
+    }
+
+
 @app.post("/v1/score", dependencies=[Depends(validate_json_request)])
 async def v1_score_request(request: ScoringRequest, raw_request: Request):
     """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
@@ -1514,8 +1619,13 @@ def _execute_server_warmup(server_args: ServerArgs):
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
-    elif is_vlm and server_args.disaggregation_mode == "null":
+    elif (
+        is_vlm
+        and server_args.disaggregation_mode == "null"
+        and model_info["is_generation"]
+    ):
         # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
+        # Only use chat completions format for generation models, not embedding models
         json_data = {
             "model": _global_state.tokenizer_manager.served_model_name,
             "messages": [
