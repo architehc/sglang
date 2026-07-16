@@ -33,7 +33,7 @@ GLOBAL_AMAX choice: a per-tensor runtime amax would need a cross-token
 reduction + host sync (.item()) and is NOT CUDA-graph capture-safe, and a
 "running amax" would make previously written rows decode incorrectly when it
 changes. We therefore use a FIXED calibrated constant, read once at import
-time from env SGLANG_NSA_KV_NVFP4_GLOBAL_AMAX (default 64.0). Behavior when
+time from env SGLANG_NSA_KV_NVFP4_GLOBAL_AMAX (default 128.0). Behavior when
 miscalibrated is graceful:
   * actual block amax > GLOBAL_AMAX: the fp8 block scale saturates at 448 and
     values clamp to +-GLOBAL_AMAX (hard clip only above the constant);
@@ -81,6 +81,13 @@ OFF_ROPE_S = NOPE_PART_BYTES + ROPE_Q_BYTES  # 320
 FP8_SCALE_MAX = 448.0
 E2M1_MAX = 6.0
 
+# Fixed calibrated global amax, read once at import time. Read via os.environ
+# (not sglang.srt.environ) so this file stays importable standalone; the same
+# variable is registered in environ.py for discoverability. Default 128.0
+# matches the validated GLM-5.2 1M profile (run_glm52_1m_fast.sh). Fixed once
+# per process => capture-safe.
+_NVFP4_GLOBAL_AMAX = float(os.environ.get("SGLANG_NSA_KV_NVFP4_GLOBAL_AMAX", "128.0"))
+
 _fp8_dtype = torch.float8_e4m3fn
 
 
@@ -98,10 +105,9 @@ def nvfp4_row_bytes(kv_lora_rank: int, qk_rope_head_dim: int) -> int:
 
 
 def nvfp4_global_amax() -> float:
-    # Read via os.environ (not sglang.srt.environ) so this file stays
-    # importable standalone; the same variable is registered in environ.py
-    # for discoverability. Fixed once per process => capture-safe.
-    return float(os.environ.get("SGLANG_NSA_KV_NVFP4_GLOBAL_AMAX", "64.0"))
+    # Cached at import (see above): re-reading the env per call would let a
+    # mid-process change desync already-written rows from the decode scale.
+    return _NVFP4_GLOBAL_AMAX
 
 
 def nvfp4_global_scale() -> float:

@@ -388,7 +388,7 @@ class Envs:
     # constant for CUDA-graph capture safety; values above it are clamped.
     # NOTE: read via os.environ in nsa/nvfp4_kv_cache.py (kept sglang-free
     # for the offline bench harness); registered here for discoverability.
-    SGLANG_NSA_KV_NVFP4_GLOBAL_AMAX = EnvFloat(64.0)
+    SGLANG_NSA_KV_NVFP4_GLOBAL_AMAX = EnvFloat(128.0)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
