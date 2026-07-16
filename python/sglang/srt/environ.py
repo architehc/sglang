@@ -389,6 +389,12 @@ class Envs:
     # NOTE: read via os.environ in nsa/nvfp4_kv_cache.py (kept sglang-free
     # for the offline bench harness); registered here for discoverability.
     SGLANG_NSA_KV_NVFP4_GLOBAL_AMAX = EnvFloat(128.0)
+    # Scope the tilelang prefill KV dequant hop to the populated pool-row
+    # prefix (rows < max(seq_lens_cpu) + 1) instead of the full allocation.
+    # Only exact for single-session contiguous-growth workloads (fresh
+    # server, prefix-growing requests); see _scope_prefill_pool_rows in
+    # nsa_backend.py. Default OFF.
+    SGLANG_NSA_PREFILL_DEQUANT_SCOPE = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

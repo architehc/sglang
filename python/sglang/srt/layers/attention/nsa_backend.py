@@ -78,6 +78,36 @@ _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is
 # enabled). Launch-time toggle, frozen at import instead of read per forward.
 _NSA_FUSE_TOPK = envs.SGLANG_NSA_FUSE_TOPK.get()
 
+# Scope the tilelang prefill KV dequant to the populated pool-row prefix
+# (default: disabled). Launch-time toggle, frozen at import.
+_NSA_PREFILL_DEQUANT_SCOPE = envs.SGLANG_NSA_PREFILL_DEQUANT_SCOPE.get()
+
+
+def _scope_prefill_pool_rows(kv_cache: torch.Tensor, seq_lens_cpu: Optional[torch.Tensor]) -> torch.Tensor:
+    """Slice the KV pool to the populated row prefix before a full-pool
+    dequant hop (SGLANG_NSA_PREFILL_DEQUANT_SCOPE=1, default OFF).
+
+    Dequant is row-independent (per-row scales), so dequantizing a row slice
+    is bit-identical to dequantizing the full pool on the overlapping rows;
+    the tilelang kernel only ever reads rows listed in page_table_1, so the
+    result is bit-identical end-to-end iff every referenced pool row is
+    below the cut.
+
+    Host-side bound: max(seq_lens_cpu) + 1 (CPU tensor -> no device sync).
+    +1 because the token-pool free list starts handing out rows at row 1,
+    so a max-seqlen request can reference row index max_seqlen itself. The
+    bound is exact when pool rows are allocated lowest-first and never
+    recycled above the live prefix, i.e. the single-session contiguous-
+    growth workload (fresh server, bs=1 prefix-growing ladder). It is NOT
+    guaranteed for interleaved multi-session batches or after radix-cache
+    eviction recycles high rows, which is why this stays env-gated OFF by
+    default; use it only for the long-context single-session sweeps.
+    """
+    if not _NSA_PREFILL_DEQUANT_SCOPE or seq_lens_cpu is None:
+        return kv_cache
+    max_active = int(seq_lens_cpu.max().item()) + 1
+    return kv_cache[:max_active]
+
 
 def _torch_fast_topk_v2(score, lengths, topk, row_starts=None, prewindowed=False):
     """Pure-torch replacement for sgl_kernel.fast_topk_v2.
@@ -1555,6 +1585,9 @@ class NativeSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                # Host-side seqlens, only consumed when
+                # SGLANG_NSA_PREFILL_DEQUANT_SCOPE=1 (see _forward_tilelang).
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
         elif nsa_impl == "flashmla_sparse":
             if q_rope is not None:
@@ -1977,6 +2010,7 @@ class NativeSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.nsa.tilelang_kernel import tilelang_sparse_fwd
 
@@ -2007,21 +2041,21 @@ class NativeSparseAttnBackend(
             else:
                 # Prefill chunk: full-pool dequant amortizes over thousands
                 # of tokens (mirrors the fp8 branch below).
-                kv_cache = dequantize_k_cache_nvfp4(kv_cache)
+                kv_cache = dequantize_k_cache_nvfp4(_scope_prefill_pool_rows(kv_cache, seq_lens_cpu))
         elif kv_cache.dtype == torch.float8_e4m3fn:
             from sglang.srt.layers.attention.nsa.dequant_k_cache import (
                 dequantize_k_cache,
             )
 
             if q_all.shape[0] <= 64:
-                # Decode/verify: dequantize ONLY the gathered top-k rows
-                # (q_rows x 2048 x 656B, ~1-100MB) instead of the whole pool
-                # (which costs ~0.5GB per layer per token).
+                # Decode/verify: fused gather+dequant of ONLY the top-k rows
+                # (q_rows x 2048 x 656B, ~1-100MB) directly from the paged
+                # pool, instead of the whole pool (~0.5GB per layer per
+                # token). Bit-identical to the previous gather + dense
+                # dequant two-step (same per-row triton math).
                 nq = q_all.shape[0]
                 flat_rows = page_table_1.reshape(-1).clamp_min(0).long()
-                gathered = kv_cache[flat_rows]
-                deq = dequantize_k_cache(gathered)
-                kv_cache = deq
+                kv_cache = dequantize_k_cache_paged(kv_cache, flat_rows)
                 topk = page_table_1.shape[-1]
                 local = (
                     torch.arange(nq * topk, device=page_table_1.device, dtype=page_table_1.dtype)
@@ -2031,7 +2065,7 @@ class NativeSparseAttnBackend(
                 page_table_1 = torch.where(page_table_1 >= 0, local, page_table_1)
             else:
                 # Prefill chunk: full-pool dequant amortizes over thousands of tokens.
-                kv_cache = dequantize_k_cache(kv_cache)
+                kv_cache = dequantize_k_cache(_scope_prefill_pool_rows(kv_cache, seq_lens_cpu))
 
         return tilelang_sparse_fwd(
             q=q_all,
