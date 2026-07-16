@@ -4,13 +4,23 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
+# Launch-time toggle, frozen at import (same pattern as _NSA_FUSE_TOPK):
+# set SGLANG_NSA_TRANSFORM_REF=1 to fall back to the torch gather reference.
+_NSA_TRANSFORM_REF = envs.SGLANG_NSA_TRANSFORM_REF.get()
+
 
 def transform_index_page_table_prefill(**kwargs):
     return transform_index_page_table_prefill_ref(**kwargs)
 
 
 def transform_index_page_table_decode(**kwargs):
-    return transform_index_page_table_decode_ref(**kwargs)
+    # The Triton fast path hardcodes TOPK=2048; route other topk widths to
+    # the reference rather than trip its assert.
+    if _NSA_TRANSFORM_REF or kwargs["topk_indices"].shape[1] != 2048:
+        return transform_index_page_table_decode_ref(**kwargs)
+    return transform_index_page_table_decode_fast(**kwargs)
 
 
 @triton.jit

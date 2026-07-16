@@ -375,6 +375,9 @@ class Envs:
 
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
+    # Use the torch gather reference for the decode page-table transform
+    # instead of the Triton fast path (debug/fallback).
+    SGLANG_NSA_TRANSFORM_REF = EnvBool(False)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_VERIFY_FUSED_METADATA_COPY = EnvBool(False)
