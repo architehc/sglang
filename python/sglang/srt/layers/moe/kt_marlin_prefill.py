@@ -52,6 +52,10 @@ Env knobs
     SGLANG_KT_MARLIN_PREFILL_LOAD_WORKERS host-ring loader threads (default 1)
     SGLANG_KT_MARLIN_PREFILL_NUMA_NODE    bind host allocation/loaders to this
                                           NUMA node (unset by default)
+    SGLANG_KT_MARLIN_SINGLE_COPY=1        load layers with chunked os.preadv
+                                          straight into the slot instead of
+                                          safetensors mmap get_tensor+copy_
+                                          (default 0)
 """
 
 from __future__ import annotations
@@ -79,6 +83,9 @@ _STREAMED_NAMES = [
 _ZP_NAMES = ["w13_weight_zero_point", "w2_weight_zero_point"]
 
 _META_FILENAME = "meta.json"
+
+# Chunk size for the SGLANG_KT_MARLIN_SINGLE_COPY os.preadv load path.
+_PREAD_CHUNK = 1 << 30
 
 # safetensors header dtype strings -> torch dtypes. get_slice(name).get_dtype()
 # returns a string (e.g. "I32"), not a torch.dtype, so header-only validation
@@ -178,6 +185,17 @@ class MarlinPrefillCache:
         self._layer_id_set = set(self.layer_ids)
 
         self.pin = os.environ.get("SGLANG_KT_MARLIN_PREFILL_PIN", "1") == "1"
+        # Measured on the 3995WX target (warm page cache, 5.20 GiB layers):
+        # safetensors mmap get_tensor+copy_ costs ~0.44 s/layer of which only
+        # ~0.22 s is the copy; the rest is the deferred munmap of the 5.2 GiB
+        # mapping at frame teardown (page-table teardown + TLB shootdown).
+        # munmap also takes mmap_lock exclusively, which serializes concurrent
+        # loader threads (1->4 workers: 14.2 -> 16.0 GiB/s, no scaling). The
+        # preadv path has no mapping to tear down.
+        self._single_copy = (
+            os.environ.get("SGLANG_KT_MARLIN_SINGLE_COPY", "0") == "1"
+            and hasattr(os, "preadv")
+        )
         self._tensor_names = list(_STREAMED_NAMES)
         if not self.symmetric:
             self._tensor_names += _ZP_NAMES
@@ -257,7 +275,7 @@ class MarlinPrefillCache:
             )
             logger.info(
                 "[KT-marlin-prefill] host ring: %d x %.2f GiB = %.2f GiB "
-                "(layers=%d, pin=%s, workers=%d, numa=%s, backing=%s)",
+                "(layers=%d, pin=%s, workers=%d, numa=%s, single_copy=%s, backing=%s)",
                 self.num_host_buffers,
                 slot_bytes / 1024**3,
                 slot_bytes * self.num_host_buffers / 1024**3,
@@ -265,6 +283,7 @@ class MarlinPrefillCache:
                 self.pin,
                 n_workers,
                 self.numa_node,
+                self._single_copy,
                 self.cache_dir,
             )
 
@@ -378,17 +397,20 @@ class MarlinPrefillCache:
             if wait_event is not None:
                 wait_event.synchronize()
             path = self.cache_dir / _layer_filename(layer_idx)
-            with safe_open(str(path), framework="pt", device="cpu") as f:
-                for name in self._tensor_names:
-                    src = f.get_tensor(name)
-                    dst = slot.tensors[name]
-                    if src.dtype != dst.dtype or src.shape != dst.shape:
-                        raise ValueError(
-                            f"KT marlin prefill layer {layer_idx} tensor {name} "
-                            f"changed shape/dtype: got {src.dtype} {tuple(src.shape)}, "
-                            f"expected {dst.dtype} {tuple(dst.shape)}"
-                        )
-                    dst.copy_(src)
+            if self._single_copy:
+                self._pread_layer_into_slot(slot, path, layer_idx)
+            else:
+                with safe_open(str(path), framework="pt", device="cpu") as f:
+                    for name in self._tensor_names:
+                        src = f.get_tensor(name)
+                        dst = slot.tensors[name]
+                        if src.dtype != dst.dtype or src.shape != dst.shape:
+                            raise ValueError(
+                                f"KT marlin prefill layer {layer_idx} tensor {name} "
+                                f"changed shape/dtype: got {src.dtype} {tuple(src.shape)}, "
+                                f"expected {dst.dtype} {tuple(dst.shape)}"
+                            )
+                        dst.copy_(src)
         except BaseException as exc:
             error = exc
 
@@ -404,6 +426,53 @@ class MarlinPrefillCache:
                 layer_idx,
                 (time.perf_counter() - started) * 1000,
             )
+
+    def _pread_layer_into_slot(
+        self, slot: _HostBufferSlot, path: Path, layer_idx: int
+    ) -> None:
+        """Load one layer file straight into the slot with chunked os.preadv.
+
+        Reads the safetensors header for dtype/shape/data_offsets (same
+        header knowledge as validation) and streams each tensor's data
+        section into the pinned slot — a single copy from page cache to the
+        slot with no mmap to fault in or tear down.
+        """
+        with open(path, "rb") as f:
+            hlen = int.from_bytes(f.read(8), "little")
+            header = json.loads(f.read(hlen))
+            data_base = 8 + hlen
+            for name in self._tensor_names:
+                info = header[name]
+                begin, end = info["data_offsets"]
+                dst = slot.tensors[name]
+                dtype = _ST_TO_TORCH_DTYPE[info["dtype"]]
+                shape = tuple(info["shape"])
+                if dtype != dst.dtype or shape != tuple(dst.shape):
+                    raise ValueError(
+                        f"KT marlin prefill layer {layer_idx} tensor {name} "
+                        f"changed shape/dtype: got {dtype} {shape}, "
+                        f"expected {dst.dtype} {tuple(dst.shape)}"
+                    )
+                nbytes = dst.numel() * dst.element_size()
+                if end - begin != nbytes:
+                    raise ValueError(
+                        f"KT marlin prefill layer {layer_idx} tensor {name} "
+                        f"byte count changed: got {end - begin}, expected {nbytes}"
+                    )
+                view = memoryview(dst.view(torch.uint8).numpy()).cast("B")
+                done = 0
+                while done < nbytes:
+                    nread = os.preadv(
+                        f.fileno(),
+                        [view[done : done + _PREAD_CHUNK]],
+                        data_base + begin + done,
+                    )
+                    if nread <= 0:
+                        raise OSError(
+                            f"KT marlin prefill layer {layer_idx} tensor {name} "
+                            f"short read at offset {done} of {nbytes}"
+                        )
+                    done += nread
 
     def _slot_for_layer(self, layer_idx: int) -> _HostBufferSlot:
         while True:
