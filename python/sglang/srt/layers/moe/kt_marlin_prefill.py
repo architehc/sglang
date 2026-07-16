@@ -80,6 +80,22 @@ _ZP_NAMES = ["w13_weight_zero_point", "w2_weight_zero_point"]
 
 _META_FILENAME = "meta.json"
 
+# safetensors header dtype strings -> torch dtypes. get_slice(name).get_dtype()
+# returns a string (e.g. "I32"), not a torch.dtype, so header-only validation
+# must convert to keep _tensor_specs identical to the get_tensor-based path.
+_ST_TO_TORCH_DTYPE = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
 
 def _layer_filename(layer_idx: int) -> str:
     return f"layer_{layer_idx:03d}.safetensors"
@@ -277,8 +293,15 @@ class MarlinPrefillCache:
                         f"tensors: {sorted(missing)}"
                     )
                 for name in self._tensor_names:
-                    tensor = f.get_tensor(name)
-                    specs[name] = (tensor.dtype, tuple(tensor.shape))
+                    # Header-only: get_slice reports dtype/shape from the
+                    # safetensors header without touching the ~400 GiB data
+                    # region (eager safetensors versions would otherwise read
+                    # the whole cache here just to validate metadata).
+                    sl = f.get_slice(name)
+                    specs[name] = (
+                        _ST_TO_TORCH_DTYPE[sl.get_dtype()],
+                        tuple(sl.get_shape()),
+                    )
             if expected is None:
                 expected = specs
             elif specs != expected:
