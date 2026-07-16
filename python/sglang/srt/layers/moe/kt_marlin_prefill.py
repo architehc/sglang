@@ -55,7 +55,10 @@ Env knobs
     SGLANG_KT_MARLIN_SINGLE_COPY=1        load layers with chunked os.preadv
                                           straight into the slot instead of
                                           safetensors mmap get_tensor+copy_
-                                          (default 0)
+                                          (default 0); measured ~45% slower
+                                          than mmap at 1 loader worker — enable
+                                          only with
+                                          SGLANG_KT_MARLIN_PREFILL_LOAD_WORKERS>=2
 """
 
 from __future__ import annotations
@@ -436,6 +439,10 @@ class MarlinPrefillCache:
         header knowledge as validation) and streams each tensor's data
         section into the pinned slot — a single copy from page cache to the
         slot with no mmap to fault in or tear down.
+
+        Caveat: measured ~45% slower than the mmap path at 1 loader worker
+        (7.70 vs 14.19 GiB/s); use only with
+        SGLANG_KT_MARLIN_PREFILL_LOAD_WORKERS>=2.
         """
         with open(path, "rb") as f:
             hlen = int.from_bytes(f.read(8), "little")
