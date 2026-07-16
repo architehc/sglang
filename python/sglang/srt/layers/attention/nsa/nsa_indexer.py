@@ -60,6 +60,91 @@ fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+
+
+_TORCH_MQA_LOGITS = None
+
+
+def _use_torch_mqa_logits() -> bool:
+    """deep_gemm's MQA logits kernels support only SM90/SM100; on other
+    architectures (e.g. sm_120) fall back to the torch reference."""
+    global _TORCH_MQA_LOGITS
+    if _TORCH_MQA_LOGITS is None:
+        import torch as _t
+
+        try:
+            major = _t.cuda.get_device_capability()[0]
+        except Exception:
+            major = 0
+        _TORCH_MQA_LOGITS = major not in (9, 10)
+    return _TORCH_MQA_LOGITS
+
+
+
+_SM120_MQA_IMPL = None
+
+
+def _dispatch_fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=True):
+    global _SM120_MQA_IMPL
+    if _use_torch_mqa_logits():
+        # Probe the Triton kernel once; afterwards genuine runtime failures
+        # (OOM, illegal access) propagate instead of silently degrading to the
+        # much slower torch path on every call.
+        if _SM120_MQA_IMPL is None:
+            from sglang.srt.layers.attention.nsa.sm120_mqa_logits_triton import (
+                triton_fp8_mqa_logits,
+            )
+
+            try:
+                out = triton_fp8_mqa_logits(q, kv, weights, ks, ke)
+                _SM120_MQA_IMPL = triton_fp8_mqa_logits
+                import logging
+
+                logging.getLogger(__name__).info(
+                    "sm120 MQA logits backend: triton"
+                )
+                return out
+            except Exception as e:  # first-call probe only; later calls propagate
+                from sglang.srt.layers.attention.nsa.sm120_mqa_logits import (
+                    torch_fp8_mqa_logits,
+                )
+
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "sm120 MQA logits: triton kernel unavailable (%s); "
+                    "using torch fallback.", e
+                )
+                _SM120_MQA_IMPL = torch_fp8_mqa_logits
+        return _SM120_MQA_IMPL(q, kv, weights, ks, ke)
+    return deep_gemm.fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=clean_logits)
+
+
+def _dispatch_fp8_paged_mqa_logits(
+    q, kv_cache, weights, seqlens, block_tables, schedule_metadata, max_seq_len, clean_logits=True
+):
+    if _use_torch_mqa_logits():
+        try:
+            from sglang.srt.layers.attention.nsa.sm120_mqa_logits_triton import (
+                triton_fp8_paged_mqa_logits,
+            )
+
+            return triton_fp8_paged_mqa_logits(
+                q, kv_cache, weights, seqlens, block_tables, schedule_metadata, max_seq_len
+            )
+        except Exception:
+            from sglang.srt.layers.attention.nsa.sm120_mqa_logits import (
+                torch_fp8_paged_mqa_logits,
+            )
+
+            return torch_fp8_paged_mqa_logits(
+                q, kv_cache, weights, seqlens, block_tables, schedule_metadata, max_seq_len
+            )
+    return deep_gemm.fp8_paged_mqa_logits(
+        q, kv_cache, weights, seqlens, block_tables, schedule_metadata, max_seq_len, clean_logits=clean_logits
+    )
+
+
 class BaseIndexerMetadata(ABC):
     @abstractmethod
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -395,7 +480,7 @@ class Indexer(MultiPlatformOp):
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
         if _is_cuda:
             if schedule_metadata is None:
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                schedule_metadata = None if _use_torch_mqa_logits() else deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32.unsqueeze(-1) if seqlens_32.dim() == 1 else seqlens_32,
                     blocksize,
                     self.sm_count,
@@ -446,7 +531,7 @@ class Indexer(MultiPlatformOp):
                 WavePerEU=5,
             )
         else:
-            logits = deep_gemm.fp8_paged_mqa_logits(
+            logits = _dispatch_fp8_paged_mqa_logits(
                 q_fp8[:q_offset],
                 kv_cache_fp8,
                 weights[:q_offset],
@@ -458,7 +543,12 @@ class Indexer(MultiPlatformOp):
             )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        # The sm_120 paged kernels already write -inf beyond each row's seqlen.
+        topk_result = metadata.topk_transform(
+            logits,
+            self.index_topk,
+            prewindowed=(not _is_hip) and _use_torch_mqa_logits(),
+        )
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
@@ -572,7 +662,7 @@ class Indexer(MultiPlatformOp):
                         q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
                     )
                 else:
-                    logits = deep_gemm.fp8_mqa_logits(
+                    logits = _dispatch_fp8_mqa_logits(
                         q_fp8[:q_offset],
                         kv_fp8,
                         weights[:q_offset],
@@ -583,7 +673,11 @@ class Indexer(MultiPlatformOp):
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
-            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+            # The sm_120 MQA logits kernels (triton + torch fallback) write -inf
+            # outside [ks, ke) themselves, so the topk can skip its masking pass.
+            raw_topk_result = metadata.topk_transform(
+                logits, self.index_topk, ks=ks, prewindowed=(not _is_hip) and _use_torch_mqa_logits()
+            )
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 
@@ -622,7 +716,7 @@ class Indexer(MultiPlatformOp):
                         ke[start:end],
                     )
                 else:
-                    logits_chunk = deep_gemm.fp8_mqa_logits(
+                    logits_chunk = _dispatch_fp8_mqa_logits(
                         q_fp8[start:end],
                         kv_fp8,
                         weights[start:end],
@@ -656,6 +750,7 @@ class Indexer(MultiPlatformOp):
                 ke_offset=lengths_chunk,
                 batch_idx_list=batch_idx_chunk,
                 topk_indices_offset_override=topk_offset_chunk,
+                prewindowed=(not _is_hip) and _use_torch_mqa_logits(),
             )
             topk_result[start:end] = raw_topk_chunk
             start = end
@@ -786,7 +881,7 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
+                logits = _dispatch_fp8_mqa_logits(
                     q_fp8,
                     kv_fp8,
                     weights,
@@ -832,7 +927,7 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
 
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
+                logits = _dispatch_fp8_mqa_logits(
                     q_fp8,
                     kv_fp8,
                     weights,
@@ -870,7 +965,7 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
 
-        # logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
+        # logits = _dispatch_fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
         k_fp8_list = []
         k_scale_list = []
 

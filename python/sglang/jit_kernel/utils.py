@@ -140,7 +140,10 @@ def load_jit(
     :type extra_ldflags: List[str] | None
     :param extra_include_paths: Extra include paths.
     :type extra_include_paths: List[str] | None
-    :param build_directory: The build directory for JIT compilation.
+    :param build_directory: The build directory for JIT compilation. If None,
+        TVM-FFI uses ``$TVM_FFI_CACHE_DIR`` (default ``~/.cache/tvm-ffi``) as a
+        persistent cache. Set ``TVM_FFI_CACHE_DIR`` to a shared directory to
+        reuse compiled kernels across runs.
     :type build_directory: str | None
     :return: A just-in-time(JIT) compiled module.
     :rtype: Module

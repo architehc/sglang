@@ -62,9 +62,15 @@ def set_offloader(instance: BaseOffloader):
 
 
 def create_offloader_from_server_args(server_args: ServerArgs, dp_rank: int):
+    target_device = (
+        torch.device(server_args.device)
+        if server_args.device
+        else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    )
     if server_args.cpu_offload_gb > 0:
         return OffloaderV1(
-            cpu_offload_max_bytes=int(server_args.cpu_offload_gb * 1024**3)
+            cpu_offload_max_bytes=int(server_args.cpu_offload_gb * 1024**3),
+            target_device=target_device,
         )
     if server_args.offload_group_size > 0:
         assert (
@@ -82,9 +88,12 @@ def create_offloader_from_server_args(server_args: ServerArgs, dp_rank: int):
 
 
 class OffloaderV1(BaseOffloader):
-    def __init__(self, cpu_offload_max_bytes: int):
+    def __init__(
+        self, cpu_offload_max_bytes: int, target_device: torch.device = torch.device("cuda")
+    ):
         self._cpu_offload_bytes = 0
         self._cpu_offload_max_bytes = cpu_offload_max_bytes
+        self._target_device = target_device
 
     def wrap_modules(
         self,
@@ -96,11 +105,6 @@ class OffloaderV1(BaseOffloader):
 
     def maybe_offload_to_cpu(self, module: torch.nn.Module) -> torch.nn.Module:
         if (params := next(module.parameters(), None)) is None:
-            return module
-
-        device = params.device
-
-        if device == torch.device("cpu"):
             return module
 
         if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
@@ -131,14 +135,16 @@ class OffloaderV1(BaseOffloader):
             offloaded_parameters = True
 
         if offloaded_parameters:
+            module._sglang_offloaded = True
             original_forward = module.forward
+            target_device = self._target_device
 
             def forward(*args, **kwargs):
                 module.forward = original_forward
                 device_state = {
-                    # here we blindly call `to(device)`
+                    # here we blindly call `to(target_device)`
                     # if the parameter is already on the device, it will be a no-op
-                    k: v.to(device, non_blocking=True)
+                    k: v.to(target_device, non_blocking=True)
                     for k, v in module.state_dict().items()
                 }
                 output = functional_call(module, device_state, args=args, kwargs=kwargs)
@@ -207,6 +213,10 @@ class OffloaderV2(BaseOffloader):
             if module_index % self.group_size >= self.group_size - self.num_in_group:
                 submodule = submodule_accessor(module)
                 whitelist_param_names = whitelist_param_names_creator(submodule)
+                if not whitelist_param_names:
+                    # Nothing to offload for this submodule; leave it on the
+                    # inference device like any other non-offloaded module.
+                    continue
                 logger.info(
                     f"[offloader] offload {module_index=} submodule={type(submodule)} params={whitelist_param_names} memory_allocated={torch.cuda.memory_allocated()}"
                 )
@@ -221,6 +231,7 @@ class OffloaderV2(BaseOffloader):
                 )
 
         for index, module in enumerate(offload_submodules):
+            module._sglang_offloaded = True
             _hook_module_forward_for_offloader(
                 index=index,
                 module=module,
@@ -234,7 +245,7 @@ class OffloaderV2(BaseOffloader):
         for offloader in self.offloaders:
             offloader.post_init()
 
-        for i in range(self.prefetch_step):
+        for i in range(min(self.prefetch_step, len(self.offloaders))):
             self.offloaders[i].start_onload()
 
     @property
@@ -284,9 +295,12 @@ class _ModuleOffloader(ABC):
         self.device = next(module.parameters()).device
         self.alt_stream = alt_stream
 
-        assert self.device != torch.device(
-            "cpu"
-        ), "not handled device=cpu case yet (should skip this tensor)"
+        # CPU-initialized tensors are fine for the CPU offload mode; the other
+        # modes currently assume a CUDA source tensor.
+        if self.mode != "cpu":
+            assert self.device != torch.device(
+                "cpu"
+            ), "not handled device=cpu case yet (should skip this tensor)"
 
         self._device_tensors = None
         self._load_event = None

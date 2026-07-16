@@ -1204,7 +1204,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return iter
 
         def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device)
+            loader.load_weights_and_postprocess(
+                model, iter, target_device, self.model_config
+            )
             return model
 
         with set_default_torch_dtype(self.model_config.dtype):

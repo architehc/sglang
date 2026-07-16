@@ -730,6 +730,7 @@ class ServerArgs:
     kt_gpu_experts_ratio: Optional[float] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
     kt_gpu_prefill_token_threshold: Optional[int] = None
+    kt_prefill_marlin_cache: Optional[str] = None
     record_kt_gpu_expert_distribution: bool = False
     kt_enable_dynamic_expert_update: bool = False
     kt_expert_placement_strategy: str = "uniform"
@@ -4871,6 +4872,22 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kt_gpu_prefill_token_threshold,
             help="[ktransformers parameter] Token threshold for loading full layer from disk to GPU during prefill. When batch token count exceeds this threshold, temporarily load complete layer from disk instead of using CPU experts.",
+        )
+        parser.add_argument(
+            "--kt-prefill-marlin-cache",
+            type=str,
+            default=ServerArgs.kt_prefill_marlin_cache,
+            help="[ktransformers parameter] Directory of pre-repacked Marlin "
+            "expert weight blobs (built offline with "
+            "tools/build_marlin_prefill_cache.py from an INT4 "
+            "compressed-tensors checkpoint). When set together with "
+            "--kt-gpu-prefill-token-threshold, prefill chunks at or above the "
+            "threshold stream each MoE layer's full expert set through a "
+            "bounded host staging ring to the GPU and run fused_marlin_moe "
+            "there, instead of "
+            "computing experts on CPU. Required for GPU prefill when "
+            "--kt-method LLAMAFILE (GGUF CPU experts cannot export GPU-format "
+            "weights). Currently tensor-parallel-size 1 only.",
         )
         parser.add_argument(
             "--record-kt-gpu-expert-distribution",

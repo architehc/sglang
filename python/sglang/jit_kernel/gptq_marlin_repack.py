@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -11,6 +12,16 @@ if TYPE_CHECKING:
 
 # Constants matching device::marlin:: in marlin.cuh
 _TILE_SIZE = 16
+
+# Prefer the AOT sgl_kernel implementation when it is available; this avoids
+# the multi-second TVM-FFI JIT compile on first use. The AOT symbol has the
+# same signature as the JIT wrapper.
+_AOT_GPTQ_MARLIN_REPACK = None
+if os.environ.get("SGLANG_FORCE_JIT_GPTQ_MARLIN_REPACK", "0") != "1":
+    try:
+        from sgl_kernel import gptq_marlin_repack as _AOT_GPTQ_MARLIN_REPACK
+    except Exception:
+        _AOT_GPTQ_MARLIN_REPACK = None
 
 
 @cache_once
@@ -29,6 +40,9 @@ def gptq_marlin_repack(
     size_n: int,
     num_bits: int,
 ) -> torch.Tensor:
+    if _AOT_GPTQ_MARLIN_REPACK is not None and b_q_weight.is_cuda:
+        return _AOT_GPTQ_MARLIN_REPACK(b_q_weight, perm, size_k, size_n, num_bits)
+
     pack_factor = 32 // num_bits
 
     # Allocate output tensor

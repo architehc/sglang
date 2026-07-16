@@ -7,7 +7,6 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
-import numpy
 import torch
 
 from sglang.srt.layers.parameter import (
@@ -20,11 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.quantization.utils import (
-    get_scalar_types,
-    pack_cols,
-    unpack_cols,
-)
+from sglang.srt.layers.quantization.utils import get_scalar_types
 from sglang.srt.utils import get_device_capability, is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -335,16 +330,55 @@ def marlin_moe_permute_scales(
     size_n: int,
     group_size: int,
 ):
-    num_experts = s.shape[0]
-    output = torch.empty(
-        (num_experts, s.shape[1], s.shape[2]),
-        device=s.device,
-        dtype=s.dtype,
-    )
+    """Permute MoE scales for all experts in a single batched operation.
 
-    for e in range(num_experts):
-        output[e] = marlin_permute_scales(s[e], size_k, size_n, group_size)
-    return output
+    Flattens the expert dimension into the K (row) dimension so that the
+    per-expert ``marlin_permute_scales`` logic can be applied to all experts
+    without a Python loop.
+    """
+    num_experts = s.shape[0]
+    if num_experts == 1:
+        return marlin_permute_scales(s[0], size_k, size_n, group_size).unsqueeze(0)
+
+    # s shape: [E, G, N]; treat as [E*G, N] with effective size_k = E*size_k.
+    flat = s.reshape(num_experts * s.shape[1], s.shape[2])
+    permuted = marlin_permute_scales(
+        flat, size_k=num_experts * size_k, size_n=size_n, group_size=group_size
+    )
+    return permuted.reshape(num_experts, s.shape[1], s.shape[2])
+
+
+def _pack_cols_torch(
+    q_w: torch.Tensor, num_bits: int, size_k: int, size_n: int
+) -> torch.Tensor:
+    """Pure-torch column packing (no numpy round-trip)."""
+    pack_factor = 32 // num_bits
+    q_w = q_w.to(torch.int32).reshape(size_k, size_n // pack_factor, pack_factor)
+    shifts = torch.arange(0, 32, num_bits, device=q_w.device, dtype=torch.int32)
+    return (q_w << shifts).sum(dim=-1, dtype=torch.int32)
+
+
+def _unpack_cols_torch(
+    packed_q_w: torch.Tensor, num_bits: int, size_k: int, size_n: int
+) -> torch.Tensor:
+    """Pure-torch column unpacking (no numpy round-trip)."""
+    pack_factor = 32 // num_bits
+    mask = torch.tensor((1 << num_bits) - 1, dtype=torch.int32, device=packed_q_w.device)
+    shifts = torch.arange(
+        0, 32, num_bits, device=packed_q_w.device, dtype=torch.int32
+    )
+    packed_q_w = packed_q_w.to(torch.int32).unsqueeze(-1)
+    return ((packed_q_w >> shifts) & mask).view(size_k, size_n)
+
+
+def _get_interleave(num_bits: int, device: torch.device) -> torch.Tensor:
+    if num_bits == 4:
+        return torch.tensor(
+            [0, 2, 4, 6, 1, 3, 5, 7], device=device, dtype=torch.long
+        )
+    if num_bits == 8:
+        return torch.tensor([0, 2, 1, 3], device=device, dtype=torch.long)
+    raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
 
 
 def marlin_zero_points(
@@ -356,16 +390,10 @@ def marlin_zero_points(
     zp = zp.reshape((-1, len(scale_perm)))[:, scale_perm]
 
     # Interleave column dim (for the dequantize code) and pack it to int32
-    if num_bits == 4:
-        interleave = numpy.array([0, 2, 4, 6, 1, 3, 5, 7])
-    elif num_bits == 8:
-        interleave = numpy.array([0, 2, 1, 3])
-    else:
-        raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
-
+    interleave = _get_interleave(num_bits, zp.device)
     zp = zp.reshape((-1, len(interleave)))[:, interleave].ravel()
     zp = zp.reshape((-1, size_n)).contiguous()
-    zp = pack_cols(zp, num_bits, size_k, size_n)
+    zp = _pack_cols_torch(zp, num_bits, size_k, size_n)
 
     return zp
 
@@ -377,15 +405,10 @@ def awq_to_marlin_zero_points(
     # In addition, the values are permuted based on dequantizer.
     # Here we undo both of these, and then apply marlin permutation
     # and pack it back.
-    q_zp = unpack_cols(q_zp_packed, num_bits, size_k, size_n)
+    q_zp = _unpack_cols_torch(q_zp_packed, num_bits, size_k, size_n)
 
     # Undo interleaving (use argsort(..) to get inverse perm)
-    if num_bits == 4:
-        undo_interleave = numpy.argsort(numpy.array([0, 2, 4, 6, 1, 3, 5, 7]))
-    elif num_bits == 8:
-        undo_interleave = numpy.argsort(numpy.array([0, 2, 1, 3]))
-    else:
-        raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
+    undo_interleave = torch.argsort(_get_interleave(num_bits, q_zp.device))
 
     q_zp = q_zp.reshape((-1, len(undo_interleave)))[:, undo_interleave].ravel()
     q_zp = q_zp.reshape((-1, size_n)).contiguous()
@@ -406,6 +429,51 @@ def moe_awq_to_marlin_zero_points(
     for e in range(num_experts):
         output[e] = awq_to_marlin_zero_points(q_zp_packed[e], size_k, size_n, num_bits)
     return output
+
+
+def marlin_moe_zero_points(
+    q_zp_packed: torch.Tensor, size_k: int, size_n: int, num_bits: int
+):
+    """Repack compressed-tensors packed zero-points for Marlin MoE kernels.
+
+    This implementation fuses the per-expert loop by flattening the expert
+    dimension into the K dimension, allowing the underlying torch/numpy ops
+    to process all experts in one batched call.
+
+    Args:
+        q_zp_packed: Packed zero-points of shape
+            (num_experts, num_groups, size_n // pack_factor).
+        size_k: Number of groups along the K dimension (i.e. num_groups).
+        size_n: Output dimension N.
+        num_bits: Quantization bit-width (4 or 8).
+
+    Returns:
+        Tensor of shape (num_experts, num_groups, size_n // pack_factor) in
+        Marlin zero-point layout.
+    """
+    num_experts = q_zp_packed.shape[0]
+    if num_experts == 1:
+        return marlin_zero_points(
+            _unpack_cols_torch(q_zp_packed[0], num_bits, size_k, size_n),
+            size_k=size_k,
+            size_n=size_n,
+            num_bits=num_bits,
+        ).unsqueeze(0)
+
+    # Flatten experts into rows: [E*G, N//pack]
+    flat_packed = q_zp_packed.reshape(num_experts * size_k, -1)
+    unpacked = _unpack_cols_torch(
+        flat_packed, num_bits, size_k=num_experts * size_k, size_n=size_n
+    )
+    # unpacked shape: [E*G, N]
+    marlin_zp = marlin_zero_points(
+        unpacked,
+        size_k=num_experts * size_k,
+        size_n=size_n,
+        num_bits=num_bits,
+    )
+    # marlin_zp shape: [E*G, N//pack]
+    return marlin_zp.reshape(num_experts, size_k, -1)
 
 
 def maybe_warn_marlin_atomic_add(device, dtype):

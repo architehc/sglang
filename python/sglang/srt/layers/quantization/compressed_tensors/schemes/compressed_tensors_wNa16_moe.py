@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -17,7 +18,11 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
-from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
+from sglang.srt.layers.quantization.marlin_utils import (
+    marlin_moe_permute_scales,
+    marlin_moe_zero_points,
+    moe_awq_to_marlin_zero_points,
+)
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
 
@@ -49,6 +54,84 @@ if _use_aiter:
 logger = logging.getLogger(__name__)
 
 
+class _SparseStagingPool:
+    """Global pinned-CPU staging buffers for sparse top-k expert loading.
+
+    MoE layers execute sequentially, so a small pool of buffers per parameter
+    shape is sufficient.  Two slots are used so the CPU can fill the buffer for
+    layer :math:`l+1` while the GPU still consumes the buffer for layer
+    :math:`l`.
+    """
+
+    def __init__(self):
+        self._buffers: dict[tuple, list[torch.Tensor]] = {}
+        self._events: dict[tuple, list[torch.cuda.Event]] = {}
+
+    def get(
+        self,
+        name: str,
+        dtype: torch.dtype,
+        per_expert_shape: tuple,
+        max_active: int,
+        slot: int,
+    ) -> torch.Tensor:
+        key = (name, dtype, per_expert_shape, max_active)
+        if key not in self._buffers:
+            bufs = [
+                torch.empty(
+                    (max_active, *per_expert_shape),
+                    dtype=dtype,
+                    device=torch.device("cpu"),
+                    pin_memory=True,
+                )
+                for _ in range(2)
+            ]
+            evs = [torch.cuda.Event(enable_timing=False) for _ in range(2)]
+            # Mark buffers as initially free.
+            for ev in evs:
+                ev.record()
+            self._buffers[key] = bufs
+            self._events[key] = evs
+        return self._buffers[key][slot]
+
+    def wait(self, name: str, dtype: torch.dtype, per_expert_shape: tuple, max_active: int, slot: int):
+        key = (name, dtype, per_expert_shape, max_active)
+        self._events[key][slot].synchronize()
+
+    def record(self, name: str, dtype: torch.dtype, per_expert_shape: tuple, max_active: int, slot: int):
+        key = (name, dtype, per_expert_shape, max_active)
+        self._events[key][slot].record(torch.cuda.current_stream())
+
+
+_SPARSE_STAGING_POOL = _SparseStagingPool()
+
+
+def _get_sparse_staging(
+    name: str,
+    dtype: torch.dtype,
+    per_expert_shape: tuple,
+    max_active: int,
+    slot: int,
+) -> torch.Tensor:
+    # `get` lazily creates the buffers and events; after creation we can wait
+    # on the event for this slot before the CPU overwrites it.
+    staging = _SPARSE_STAGING_POOL.get(
+        name, dtype, per_expert_shape, max_active, slot
+    )
+    _SPARSE_STAGING_POOL.wait(name, dtype, per_expert_shape, max_active, slot)
+    return staging
+
+
+def _record_sparse_staging(
+    name: str,
+    dtype: torch.dtype,
+    per_expert_shape: tuple,
+    max_active: int,
+    slot: int,
+):
+    _SPARSE_STAGING_POOL.record(name, dtype, per_expert_shape, max_active, slot)
+
+
 class GPTQMarlinState(Enum):
     REPACK = enum.auto()
     READY = enum.auto()
@@ -64,7 +147,13 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         self.strategy = config.strategy
         self.group_size = config.group_size
         self.actorder = config.actorder
-        assert config.symmetric, "Only symmetric quantization is supported for MoE"
+        self.symmetric = config.symmetric
+        self.sparse_load = get_bool_env_var(
+            "SGLANG_OPT_MOE_TOPK_LOAD", default="false"
+        )
+        self.use_awq_repack = get_bool_env_var(
+            "SGLANG_OPT_MOE_TOPK_LOAD_AWQ", default="false"
+        )
 
         if not (
             self.quant_config.quant_format == CompressionFormat.pack_quantized.value
@@ -95,6 +184,10 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         # Will transpose the loaded weight along the
         # intermediate and hidden dim sizes. Will
         # shard for TP along the transposed dims
+        # With sparse_load the large expert tensors stay in CPU pinned/host memory
+        # and only the active top-k experts are copied to the GPU each forward.
+        weight_device = torch.device("cpu") if self.sparse_load else None
+
         extra_weight_attrs.update(
             {"is_transposed": True, "quant_method": self.strategy}
         )
@@ -104,6 +197,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 hidden_size // self.packed_factor,
                 2 * intermediate_size_per_partition,
                 dtype=torch.int32,
+                device=weight_device,
             ),
             requires_grad=False,
         )
@@ -116,6 +210,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 intermediate_size_per_partition // self.packed_factor,
                 hidden_size,
                 dtype=torch.int32,
+                device=weight_device,
             ),
             requires_grad=False,
         )
@@ -146,6 +241,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 num_groups_w13,
                 2 * intermediate_size_per_partition,
                 dtype=params_dtype,
+                device=weight_device,
             ),
             requires_grad=False,
         )
@@ -153,7 +249,13 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w13_scale, extra_weight_attrs)
 
         w2_scale = torch.nn.Parameter(
-            torch.ones(num_experts, num_groups_w2, hidden_size, dtype=params_dtype),
+            torch.ones(
+                num_experts,
+                num_groups_w2,
+                hidden_size,
+                dtype=params_dtype,
+                device=weight_device,
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_scale)
@@ -161,22 +263,50 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w2_scale, {"load_full_w2": load_full_w2})
 
         w2_weight_shape = torch.nn.Parameter(
-            torch.empty(num_experts, 2), requires_grad=False
+            torch.empty(num_experts, 2, device=weight_device), requires_grad=False
         )
         layer.register_parameter("w2_weight_shape", w2_weight_shape)
         set_weight_attrs(w2_weight_shape, extra_weight_attrs)
         w13_weight_shape = torch.nn.Parameter(
-            torch.empty(num_experts, 2), requires_grad=False
+            torch.empty(num_experts, 2, device=weight_device), requires_grad=False
         )
 
         layer.register_parameter("w13_weight_shape", w13_weight_shape)
         set_weight_attrs(w13_weight_shape, extra_weight_attrs)
+
+        if not self.symmetric:
+            w13_weight_zero_point = torch.nn.Parameter(
+                torch.zeros(
+                    num_experts,
+                    num_groups_w13,
+                    2 * intermediate_size_per_partition // self.packed_factor,
+                    dtype=torch.int32,
+                    device=weight_device,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_zero_point", w13_weight_zero_point)
+            set_weight_attrs(w13_weight_zero_point, extra_weight_attrs)
+
+            w2_weight_zero_point = torch.nn.Parameter(
+                torch.zeros(
+                    num_experts,
+                    num_groups_w2,
+                    hidden_size // self.packed_factor,
+                    dtype=torch.int32,
+                    device=weight_device,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_zero_point", w2_weight_zero_point)
+            set_weight_attrs(w2_weight_zero_point, extra_weight_attrs)
 
         w13_g_idx = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 hidden_size,
                 dtype=torch.int32,
+                device=weight_device,
             ),
             requires_grad=False,
         )
@@ -188,6 +318,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 num_experts,
                 intermediate_size_per_partition,
                 dtype=torch.int32,
+                device=weight_device,
             ),
             requires_grad=False,
         )
@@ -199,6 +330,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 num_experts,
                 hidden_size,
                 dtype=torch.int32,
+                device=weight_device,
             ),
             requires_grad=False,
         )
@@ -210,6 +342,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 num_experts,
                 intermediate_size_per_partition,
                 dtype=torch.int32,
+                device=weight_device,
             ),
             requires_grad=False,
         )
@@ -230,6 +363,20 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         # Also record the shapes of the scales.
         layer._original_shapes["w2_weight_scale"] = tuple(w2_scale.shape)
         layer._original_shapes["w13_weight_scale"] = tuple(w13_scale.shape)
+
+        if not self.symmetric:
+            layer._original_shapes["w13_weight_zero_point"] = tuple(
+                w13_weight_zero_point.shape
+            )
+            layer._original_shapes["w2_weight_zero_point"] = tuple(
+                w2_weight_zero_point.shape
+            )
+
+        if self.sparse_load:
+            # Tell the model loader that this module's parameters should stay on
+            # CPU even though they are not managed by OffloaderV2. The quant
+            # method copies only the active top-k experts to the GPU each forward.
+            layer._sglang_offloaded = True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
@@ -256,6 +403,25 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         num_experts = layer.w13_weight_g_idx.shape[0]
         device = layer.w13_weight_g_idx.device
+
+        # With the KT EP wrapper handling all routed experts on CPU
+        # (--kt-num-gpu-experts 0), the GPU layer owns zero experts and every
+        # weight tensor here is empty; the Marlin repack kernels cannot handle
+        # 0-expert inputs, so there is nothing to convert.
+        if num_experts == 0 or layer.w13_weight_packed.numel() == 0:
+            layer.is_marlin_converted = True
+            return
+
+        # Sparse load keeps the full expert tensors in CPU memory. The Marlin
+        # repack / scale-permutation kernels are much faster on the GPU, so move
+        # the source tensors to CUDA temporarily and let `replace_tensor` copy
+        # the results back to the CPU parameter buffers.
+        repack_device = device
+        if self.sparse_load and not layer.w13_weight_packed.is_cuda:
+            repack_device = torch.device("cuda")
+
+        def _to_repack(t):
+            return t.to(repack_device) if t.device != repack_device else t
 
         # when running models with grouped act order,
         # resort to g_idx values provided in checkpoint
@@ -301,16 +467,16 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             )
 
         marlin_w13_qweight = gptq_marlin_moe_repack(
-            layer.w13_weight_packed,
-            layer.w13_g_idx_sort_indices,
+            _to_repack(layer.w13_weight_packed),
+            _to_repack(layer.w13_g_idx_sort_indices),
             layer.w13_weight_packed.shape[1] * self.packed_factor,
             layer.w13_weight_packed.shape[2],
             self.num_bits,
         )
         replace_tensor("w13_weight_packed", marlin_w13_qweight)
         marlin_w2_qweight = gptq_marlin_moe_repack(
-            layer.w2_weight_packed,
-            layer.w2_g_idx_sort_indices,
+            _to_repack(layer.w2_weight_packed),
+            _to_repack(layer.w2_g_idx_sort_indices),
             layer.w2_weight_packed.shape[1] * self.packed_factor,
             layer.w2_weight_packed.shape[2],
             self.num_bits,
@@ -318,7 +484,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         replace_tensor("w2_weight_packed", marlin_w2_qweight)
         # Repack scales
         marlin_w13_scales = marlin_moe_permute_scales(
-            layer.w13_weight_scale,
+            _to_repack(layer.w13_weight_scale),
             layer.w13_weight_packed.shape[2],
             layer.w13_weight_scale.shape[2],
             self.group_size,
@@ -326,13 +492,68 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         replace_tensor("w13_weight_scale", marlin_w13_scales)
 
         marlin_w2_scales = marlin_moe_permute_scales(
-            layer.w2_weight_scale,
+            _to_repack(layer.w2_weight_scale),
             layer.w2_weight_scale.shape[1]
             * (self.group_size if self.group_size != -1 else self.packed_factor),
             layer.w2_weight_scale.shape[2],
             self.group_size,
         )
         replace_tensor("w2_weight_scale", marlin_w2_scales)
+
+        # Repack zero-points for asymmetric quantization.
+        if not self.symmetric:
+            zp_fn = (
+                moe_awq_to_marlin_zero_points
+                if self.use_awq_repack
+                else marlin_moe_zero_points
+            )
+            marlin_w13_zp = zp_fn(
+                _to_repack(layer.w13_weight_zero_point),
+                size_k=layer.w13_weight_zero_point.shape[1],
+                size_n=layer.w13_weight_zero_point.shape[2] * self.packed_factor,
+                num_bits=self.num_bits,
+            )
+            replace_tensor("w13_weight_zero_point", marlin_w13_zp)
+
+            marlin_w2_zp = zp_fn(
+                _to_repack(layer.w2_weight_zero_point),
+                size_k=layer.w2_weight_zero_point.shape[1],
+                size_n=layer.w2_weight_zero_point.shape[2] * self.packed_factor,
+                num_bits=self.num_bits,
+            )
+            replace_tensor("w2_weight_zero_point", marlin_w2_zp)
+
+        # For the sparse-load path, pin the CPU master tensors so that the
+        # per-forward top-k slices can be copied to the GPU asynchronously.
+        # This is a best-effort optimization; if the OS cannot allocate enough
+        # pinned pages we fall back to pageable CPU memory and synchronous copies.
+        if self.sparse_load:
+            for name in (
+                "w13_weight_packed",
+                "w2_weight_packed",
+                "w13_weight_scale",
+                "w2_weight_scale",
+                "w13_g_idx_sort_indices",
+                "w2_g_idx_sort_indices",
+            ):
+                param = getattr(layer, name, None)
+                if param is not None and not param.is_cuda and not param.is_pinned():
+                    try:
+                        param.data = param.data.pin_memory()
+                    except Exception:
+                        pass
+            if not self.symmetric:
+                for name in ("w13_weight_zero_point", "w2_weight_zero_point"):
+                    param = getattr(layer, name, None)
+                    if (
+                        param is not None
+                        and not param.is_cuda
+                        and not param.is_pinned()
+                    ):
+                        try:
+                            param.data = param.data.pin_memory()
+                        except Exception:
+                            pass
 
         layer.is_marlin_converted = True
 
@@ -384,21 +605,162 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             if expert_map is not None:
                 global_num_experts = self.moe_runner_config.num_experts
 
+        if not self.sparse_load:
+            # Default path: all experts are resident on the inference device.
+            output = fused_marlin_moe(
+                x,
+                layer.w13_weight_packed,
+                layer.w2_weight_packed,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                router_logits,
+                topk_weights,
+                topk_ids,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                g_idx1=layer.w13_weight_g_idx,
+                g_idx2=layer.w2_weight_g_idx,
+                sort_indices1=layer.w13_g_idx_sort_indices,
+                sort_indices2=layer.w2_g_idx_sort_indices,
+                w1_zeros=(
+                    layer.w13_weight_zero_point if not self.symmetric else None
+                ),
+                w2_zeros=(
+                    layer.w2_weight_zero_point if not self.symmetric else None
+                ),
+                num_bits=self.num_bits,
+                is_k_full=self.is_k_full,
+                routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+            )
+            return StandardCombineInput(hidden_states=output)
+
+        # Sparse top-k expert loading path: the full [E, ...] tensors live on CPU;
+        # only the experts selected by the router are copied to the GPU for this
+        # forward pass, and topk_ids are remapped to the contiguous sliced range.
+        E_full = layer.w13_weight_packed.shape[0]
+        topk_ids_cpu = topk_ids.to("cpu")
+        valid = (topk_ids_cpu >= 0) & (topk_ids_cpu < E_full)
+        active_cpu = torch.unique(topk_ids_cpu[valid]).long()
+
+        if active_cpu.numel() == 0:
+            # No valid experts selected; match the kernel's E==0 behaviour.
+            return StandardCombineInput(hidden_states=x.new_zeros_like(x))
+
+        inference_device = x.device
+        active_gpu = active_cpu.to(inference_device)
+
+        mapping = torch.full(
+            (E_full,), -1, dtype=torch.long, device=inference_device
+        )
+        mapping[active_gpu] = torch.arange(
+            active_gpu.shape[0], dtype=torch.long, device=inference_device
+        )
+        # Sanitize BEFORE indexing: KT marks CPU-routed experts as -1, so raw
+        # topk_ids can hold out-of-range ids. mapping[-1] would silently remap
+        # to the last expert; mapping[E_full] would read out of bounds.
+        valid_gpu = valid.to(inference_device)
+        safe_topk_ids = torch.where(
+            valid_gpu, topk_ids, torch.zeros_like(topk_ids)
+        )
+        new_topk_ids = torch.where(
+            valid_gpu,
+            mapping[safe_topk_ids],
+            torch.zeros_like(safe_topk_ids),
+        )
+
+        # Use a global, per-shape pinned CPU staging pool.  Slicing a pinned CPU
+        # tensor with advanced indexing returns a non-pinned tensor, so we copy
+        # the active experts into a pinned staging buffer and launch the H2D from
+        # there.  The pool is shared across MoE layers (they run sequentially),
+        # which keeps the pinned footprint modest while still allowing a large
+        # enough staging capacity for continuous-decode batches and typical
+        # prefill chunks.
+        top_k = int(topk_ids.shape[-1])
+        # Default capacity covers top_k * 8 distinct experts; with top_k=8 this
+        # handles decode batch <=8 and prefill chunks up to ~64 tokens.
+        _STAGING_CAPACITY_FACTOR = int(
+            os.environ.get("SGLANG_OPT_MOE_TOPK_LOAD_STAGING_FACTOR", "8")
+        )
+        max_active = min(E_full, top_k * _STAGING_CAPACITY_FACTOR)
+        slot = int(getattr(layer, "layer_id", 0)) % 2
+
+        # Cache the staging tensors for this layer so we only synchronize once
+        # per layer; subsequent parameters reuse the same slot without waiting.
+        _layer_stagings: dict[str, torch.Tensor] = {}
+
+        def _get_layer_staging(name, param_cpu):
+            if name not in _layer_stagings:
+                _layer_stagings[name] = _get_sparse_staging(
+                    name,
+                    param_cpu.dtype,
+                    param_cpu.shape[1:],
+                    max_active,
+                    slot,
+                )
+            return _layer_stagings[name]
+
+        def _load_active(name, param_cpu):
+            E = active_cpu.numel()
+            staging = _get_layer_staging(name, param_cpu)
+            if E <= staging.shape[0]:
+                dst = staging[:E]
+                torch.index_select(param_cpu, 0, active_cpu, out=dst)
+                gpu_tensor = dst.to(inference_device, non_blocking=True)
+                _record_sparse_staging(
+                    name,
+                    param_cpu.dtype,
+                    param_cpu.shape[1:],
+                    max_active,
+                    slot,
+                )
+                return gpu_tensor
+            # Fallback for active sets larger than the staging capacity.
+            return param_cpu[active_cpu].to(inference_device)
+
+        w13_weight_packed = _load_active(
+            "w13_weight_packed", layer.w13_weight_packed
+        )
+        w2_weight_packed = _load_active("w2_weight_packed", layer.w2_weight_packed)
+        w13_weight_scale = _load_active("w13_weight_scale", layer.w13_weight_scale)
+        w2_weight_scale = _load_active("w2_weight_scale", layer.w2_weight_scale)
+        w13_weight_g_idx = _load_active("w13_weight_g_idx", layer.w13_weight_g_idx)
+        w2_weight_g_idx = _load_active("w2_weight_g_idx", layer.w2_weight_g_idx)
+        w13_g_idx_sort_indices = _load_active(
+            "w13_g_idx_sort_indices", layer.w13_g_idx_sort_indices
+        )
+        w2_g_idx_sort_indices = _load_active(
+            "w2_g_idx_sort_indices", layer.w2_g_idx_sort_indices
+        )
+
+        if not self.symmetric:
+            w13_weight_zero_point = _load_active(
+                "w13_weight_zero_point", layer.w13_weight_zero_point
+            )
+            w2_weight_zero_point = _load_active(
+                "w2_weight_zero_point", layer.w2_weight_zero_point
+            )
+        else:
+            w13_weight_zero_point = None
+            w2_weight_zero_point = None
+
+        E_active = active_cpu.shape[0]
         output = fused_marlin_moe(
             x,
-            layer.w13_weight_packed,
-            layer.w2_weight_packed,
-            layer.w13_weight_scale,
-            layer.w2_weight_scale,
+            w13_weight_packed,
+            w2_weight_packed,
+            w13_weight_scale,
+            w2_weight_scale,
             router_logits,
             topk_weights,
-            topk_ids,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            g_idx1=layer.w13_weight_g_idx,
-            g_idx2=layer.w2_weight_g_idx,
-            sort_indices1=layer.w13_g_idx_sort_indices,
-            sort_indices2=layer.w2_g_idx_sort_indices,
+            new_topk_ids,
+            global_num_experts=E_active,
+            expert_map=None,
+            g_idx1=w13_weight_g_idx,
+            g_idx2=w2_weight_g_idx,
+            sort_indices1=w13_g_idx_sort_indices,
+            sort_indices2=w2_g_idx_sort_indices,
+            w1_zeros=w13_weight_zero_point,
+            w2_zeros=w2_weight_zero_point,
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
@@ -417,6 +779,12 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "is_triton_converted", False):
             return
+
+        if not self.symmetric:
+            raise NotImplementedError(
+                "Asymmetric WNA16 MoE is not supported with the Triton backend. "
+                "Use the Marlin backend (CUDA) instead."
+            )
 
         num_experts = layer.w13_weight_packed.shape[0]
 

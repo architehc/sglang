@@ -379,6 +379,16 @@ class Envs:
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_VERIFY_FUSED_METADATA_COPY = EnvBool(False)
     SGLANG_NSA_FORCE_MLA = EnvBool(False)
+    # Reinterpret the NSA MLA fp8 KV pool as NVFP4 (e2m1 + fp8_e4m3 block
+    # scales + static global scale). Requires --kv-cache-dtype fp8_e4m3 and
+    # tilelang NSA prefill/decode backends. 328B/token/layer vs 656B fp8.
+    SGLANG_NSA_KV_NVFP4 = EnvBool(False)
+    # Calibrated per-tensor amax for the NVFP4 KV global scale
+    # (global_scale = amax / (448 * 6), NOT the reciprocal). Must be a fixed
+    # constant for CUDA-graph capture safety; values above it are clamped.
+    # NOTE: read via os.environ in nsa/nvfp4_kv_cache.py (kept sglang-free
+    # for the offline bench harness); registered here for discoverability.
+    SGLANG_NSA_KV_NVFP4_GLOBAL_AMAX = EnvFloat(64.0)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -517,6 +527,9 @@ class Envs:
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(False)
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(False)
     SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM = EnvBool(False)  # verified in journal 2026-04-21-017
+    # allow the kt_ep (CPU experts) path into shared-expert dual-stream;
+    # the KT wrapper forks/joins via current_stream so alt_stream is consistent
+    SGLANG_KT_EP_DUAL_STREAM = EnvBool(False)
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(False)
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD = EnvBool(False)

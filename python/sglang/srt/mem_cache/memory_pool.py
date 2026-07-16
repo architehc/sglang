@@ -1409,6 +1409,15 @@ class MLATokenToKVPool(KVCache):
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
+        # SGLANG_NSA_KV_NVFP4=1 reinterprets the quantized NSA pool rows as
+        # NVFP4 (e2m1 + fp8 block scales + static global scale, 328B/token vs
+        # 656B for fp8). The CLI still says --kv-cache-dtype fp8_e4m3; the
+        # override_kv_cache_dim passed in is already the NVFP4 row size (see
+        # model_runner_kv_cache_mixin.calculate_mla_kv_cache_dim). Layout in
+        # layers/attention/nsa/nvfp4_kv_cache.py.
+        self.nsa_kv_cache_store_nvfp4 = (
+            self.nsa_kv_cache_store_fp8 and envs.SGLANG_NSA_KV_NVFP4.get()
+        )
         # When override_kv_cache_dim is provided with nsa model, we assume the
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
@@ -1515,7 +1524,27 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
 
-        if self.nsa_kv_cache_store_fp8:
+        if self.nsa_kv_cache_store_nvfp4:
+            from sglang.srt.layers.attention.nsa.nvfp4_kv_cache import (
+                quantize_k_cache_nvfp4_separate,
+            )
+
+            # NVFP4 quantize-on-write. Returns:
+            #   nope_part: (num_tokens, 1, 288) uint8 [e2m1 packed(256) | fp8 scales(32)]
+            #   rope_part: (num_tokens, 1, 40)  uint8 [e2m1 packed(32) | fp8 scales(4) | pad(4)]
+            # Reuses the same two-tensor write kernel as the fp8 path
+            # (288 + 40 = 328 = kv_cache_dim). Capture-safe: static shapes,
+            # no host sync, global scale is a process-lifetime constant.
+            cache_k_nope_nvfp4, cache_k_rope_nvfp4 = quantize_k_cache_nvfp4_separate(
+                cache_k_nope, cache_k_rope
+            )
+            set_mla_kv_buffer_triton(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k_nope_nvfp4,
+                cache_k_rope_nvfp4,
+            )
+        elif self.nsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
@@ -1554,6 +1583,11 @@ class MLATokenToKVPool(KVCache):
         dst_dtype: Optional[torch.dtype] = None,
     ):
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
+        assert not getattr(self, "nsa_kv_cache_store_nvfp4", False), (
+            "get_mla_kv_buffer does not understand the NVFP4 row layout; "
+            "this path (MHA one-shot prefill) must be disabled when "
+            "SGLANG_NSA_KV_NVFP4=1"
+        )
         layer_id = layer.layer_id
         kv_buffer = self.get_key_buffer(layer_id)
         dst_dtype = dst_dtype or self.dtype

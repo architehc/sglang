@@ -97,6 +97,7 @@ class DeepseekV2WeightLoaderMixin:
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
         is_nextn: bool = False,
+        run_post_load: bool = True,
     ):
         """Load model weights from checkpoint.
 
@@ -213,6 +214,20 @@ class DeepseekV2WeightLoaderMixin:
                     if ("mlp.experts." in name) and name not in params_dict:
                         continue
                     name = name.replace(weight_name, param_name)
+                    # The target linear may be quantized (e.g. compressed-tensors
+                    # WNA16) even if the checkpoint shard uses the plain .weight
+                    # name.  Map to the quantized parameter name when needed.
+                    if name not in params_dict and name.endswith(".weight"):
+                        for suffix in (
+                            "weight_packed",
+                            "weight_scale",
+                            "weight_zero_point",
+                            "weight_shape",
+                        ):
+                            alt_name = name.replace(".weight", f".{suffix}")
+                            if alt_name in params_dict:
+                                name = alt_name
+                                break
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
@@ -291,6 +306,22 @@ class DeepseekV2WeightLoaderMixin:
                                     []
                                 ) and kv_a_proj_weight.shape == torch.Size([]):
                                     fused_weight = q_a_proj_weight
+                                elif name.endswith("weight_shape") and (
+                                    q_a_proj_weight.numel() == 2
+                                ):
+                                    # compressed-tensors shape metadata [out, in]:
+                                    # the fused projection stacks outputs, so sum
+                                    # the out dims instead of concatenating the
+                                    # 2-element metadata vectors into a 4-vector.
+                                    assert q_a_proj_weight[1] == kv_a_proj_weight[1]
+                                    fused_weight = torch.tensor(
+                                        [
+                                            int(q_a_proj_weight[0])
+                                            + int(kv_a_proj_weight[0]),
+                                            int(q_a_proj_weight[1]),
+                                        ],
+                                        dtype=q_a_proj_weight.dtype,
+                                    )
                                 else:
                                     cat_dim = 0
                                     if self.quant_config is not None and (
@@ -314,6 +345,24 @@ class DeepseekV2WeightLoaderMixin:
                                         "fused_qkv_a_proj_with_mqa",
                                     )
                                 )
+                                # The fused attention projection may be quantized
+                                # (e.g. compressed-tensors WNA16) in which case the
+                                # model parameter is weight_packed/weight_scale/...
+                                # rather than weight.  Try the quantized names if the
+                                # plain .weight lookup fails.
+                                if param_name not in params_dict:
+                                    for suffix in (
+                                        "weight_packed",
+                                        "weight_scale",
+                                        "weight_zero_point",
+                                        "weight_shape",
+                                    ):
+                                        alt_name = param_name.replace(
+                                            ".weight", f".{suffix}"
+                                        )
+                                        if alt_name in params_dict:
+                                            param_name = alt_name
+                                            break
                                 param = params_dict[param_name]
 
                                 weight_loader = getattr(
@@ -361,7 +410,8 @@ class DeepseekV2WeightLoaderMixin:
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
-        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        if run_post_load:
+            self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """
@@ -446,6 +496,25 @@ class DeepseekV2WeightLoaderMixin:
                     raise ValueError(
                         "AWQ dequantize function is not supported for the current device"
                     )
+            elif hasattr(self_attn.kv_b_proj, "weight_packed"):
+                # compressed-tensors WNA16/Marlin stores the quantized weight in
+                # `weight_packed`. Reconstruct the BF16 weight by running the
+                # quantized linear on the identity matrix.
+                kv_b = self_attn.kv_b_proj
+                scale_param = getattr(kv_b, "weight_scale", None)
+                if scale_param is None:
+                    scale_param = next(
+                        p
+                        for p in kv_b.parameters()
+                        if p.dtype in (torch.bfloat16, torch.float16, torch.float32)
+                    )
+                eye = torch.eye(
+                    kv_b.input_size,
+                    dtype=scale_param.dtype,
+                    device=scale_param.device,
+                )
+                with torch.no_grad():
+                    w = kv_b(eye)[0].T
             else:
                 w = self_attn.kv_b_proj.weight
 

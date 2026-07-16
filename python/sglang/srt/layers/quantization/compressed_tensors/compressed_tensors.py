@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import suppress
 from typing import (
     TYPE_CHECKING,
@@ -118,6 +119,17 @@ class CompressedTensorsConfig(QuantizationConfig):
     ):
         super().__init__()
         self.ignore = ignore
+        # Workaround for GLM-5.2 AWQ-INT4 checkpoints that store raw (BF16)
+        # q_a_proj/kv_a_proj_with_mqa weights but target the fused module
+        # for quantization.  Keeping the fused module unquantized lets the
+        # loader fuse the raw checkpoint shards directly.
+        if os.environ.get("SGLANG_CT_IGNORE_FUSED_ATTN_MLP", "0") == "1":
+            extra_ignores = [
+                "re:.*fused_qkv_a_proj_with_mqa$",
+            ]
+            for pat in extra_ignores:
+                if pat not in self.ignore:
+                    self.ignore.append(pat)
         self.quant_format = quant_format
         # Map from [target -> scheme]
         self.target_scheme_map = target_scheme_map
@@ -492,14 +504,13 @@ class CompressedTensorsConfig(QuantizationConfig):
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
         input_quant_none = input_quant is None
-        is_symmetric = weight_quant.symmetric
         is_channel_group = (
             weight_quant.strategy == QuantizationStrategy.CHANNEL.value
             or weight_quant.strategy == QuantizationStrategy.GROUP.value
         )
         is_static = not weight_quant.dynamic
 
-        return is_channel_group and input_quant_none and is_symmetric and is_static
+        return is_channel_group and input_quant_none and is_static
 
     def _is_mxint4a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         input_quant_none = input_quant is None
@@ -551,6 +562,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     num_bits=weight_quant.num_bits,
                     strategy=weight_quant.strategy,
                     group_size=weight_quant.group_size,
+                    symmetric=weight_quant.symmetric,
                     actorder=weight_quant.actorder,
                 )
             else:

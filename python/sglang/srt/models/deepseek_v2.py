@@ -674,7 +674,10 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
-                and not is_wrapped_method(self.experts.quant_method, "kt_ep")
+                and (
+                    envs.SGLANG_KT_EP_DUAL_STREAM.get()
+                    or not is_wrapped_method(self.experts.quant_method, "kt_ep")
+                )
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
@@ -1669,6 +1672,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         self.use_min_latency_fused_a_gemm = (
             has_fused_proj
             and not is_packed_weight
+            and hasattr(self.fused_qkv_a_proj_with_mqa, "weight")
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
             and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
             and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
@@ -2797,6 +2801,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_format,
         )
 
+        import os as _dbg_os
+
+        _dbg = (
+            _dbg_os.environ.get("SGLANG_DEBUG_HIDDEN") == "1"
+            and hidden_states.shape[0] > 2000
+        )
+        if _dbg:
+            _in_max = hidden_states.float().abs().max().item()
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -2804,6 +2817,18 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
         )
+
+        if _dbg:
+            _att = hidden_states.float()
+            print(
+                f"[HID] L{self.layer_id} in_max={_in_max:.3e} "
+                f"attn_max={_att.abs().max().item():.3e} "
+                f"attn_nan={int(_att.isnan().sum())} "
+                f"attn_row0_max={_att[0].abs().max().item():.3e} "
+                f"attn_rowL_max={_att[-1].abs().max().item():.3e} "
+                f"attn_row2049_max={_att[2049].abs().max().item() if _att.shape[0] > 2049 else -1:.3e}",
+                flush=True,
+            )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -2837,6 +2862,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         if not should_allreduce_fusion:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
+            )
+
+        if _dbg:
+            _m = hidden_states.float()
+            print(
+                f"[HID] L{self.layer_id} mlp_max={_m.abs().max().item():.3e} "
+                f"mlp_nan={int(_m.isnan().sum())}",
+                flush=True,
             )
 
         return hidden_states, residual
@@ -2968,19 +3001,46 @@ class DeepseekV2Model(nn.Module):
                     else layer.mlp
                 ),
                 whitelist_param_names_creator=lambda module: (
-                    [
-                        "w13_weight",
-                        "w2_weight",
-                        # only for nvfp4
-                        *(
-                            [
-                                "w13_blockscale_swizzled",
-                                "w2_blockscale_swizzled",
-                            ]
-                            if hasattr(module, "w13_blockscale_swizzled")
-                            else []
-                        ),
-                    ]
+                    (
+                        []
+                        if get_bool_env_var("SGLANG_OPT_MOE_TOPK_LOAD")
+                        and isinstance(module, FusedMoE)
+                        and hasattr(module, "w13_weight_packed")
+                        else [
+                            "w13_weight_packed",
+                            "w2_weight_packed",
+                            "w13_weight_scale",
+                            "w2_weight_scale",
+                            "w13_weight_g_idx",
+                            "w2_weight_g_idx",
+                            "w13_g_idx_sort_indices",
+                            "w2_g_idx_sort_indices",
+                            "w13_weight_shape",
+                            "w2_weight_shape",
+                            *(
+                                [
+                                    "w13_weight_zero_point",
+                                    "w2_weight_zero_point",
+                                ]
+                                if hasattr(module, "w13_weight_zero_point")
+                                else []
+                            ),
+                        ]
+                        if hasattr(module, "w13_weight_packed")
+                        else [
+                            "w13_weight",
+                            "w2_weight",
+                            # only for nvfp4
+                            *(
+                                [
+                                    "w13_blockscale_swizzled",
+                                    "w2_blockscale_swizzled",
+                                ]
+                                if hasattr(module, "w13_blockscale_swizzled")
+                                else []
+                            ),
+                        ]
+                    )
                     if isinstance(module, FusedMoE)
                     else []
                 ),
@@ -3124,6 +3184,16 @@ class DeepseekV2Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
+                import os as _dsp_os
+                if (
+                    _dsp_os.environ.get("SGLANG_DSPARK_CAPTURE") == "1"
+                    and i in (8, 23, 39, 55, 70)
+                ):
+                    if not hasattr(self, "_dspark_cap"):
+                        self._dspark_cap = []
+                    if i == 8:
+                        self._dspark_cap = []
+                    self._dspark_cap.append((hidden_states + residual).detach().to(torch.bfloat16))
                 if i in self.layers_to_capture:
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
                         aux_hidden_state = tensor_model_parallel_all_gather(
@@ -3179,6 +3249,23 @@ class DeepseekV2Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+        import os as _dsp_os
+        if _dsp_os.environ.get("SGLANG_DSPARK_CAPTURE") == "1" and getattr(self, "_dspark_cap", None):
+            aux_hidden_states_dump = self._dspark_cap
+            self._dspark_cap = []
+            _dir = "/media/thread/game/dspark_port/captures"
+            _dsp_os.makedirs(_dir, exist_ok=True)
+            _n = len(_dsp_os.listdir(_dir))
+            if _n < 400:
+                torch.save(
+                    {
+                        "aux": torch.cat([a for a in aux_hidden_states_dump], dim=-1).cpu(),
+                        "input_ids": input_ids.detach().cpu(),
+                        "positions": positions.detach().cpu(),
+                    },
+                    f"{_dir}/cap_{_n:05d}.pt",
+                )
+
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
@@ -3186,7 +3273,9 @@ class DeepseekV2Model(nn.Module):
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     # for quark model load
-    packed_modules_mapping = {}
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,
@@ -3195,6 +3284,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        if quant_config is not None and hasattr(quant_config, "packed_modules_mapping"):
+            quant_config.packed_modules_mapping = self.packed_modules_mapping
 
         # for quark model load
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
@@ -3404,8 +3495,13 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def end_layer(self):
         return self.model.end_layer
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        self.do_load_weights(weights, is_nextn)
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn=False,
+        run_post_load: bool = True,
+    ):
+        self.do_load_weights(weights, is_nextn, run_post_load)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

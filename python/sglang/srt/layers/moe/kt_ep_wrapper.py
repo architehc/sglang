@@ -43,6 +43,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.distributed import (
+    get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -108,6 +109,11 @@ class KTConfig:
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
     expert_lora_path: Optional[str] = None
+    # Directory of pre-repacked Marlin expert blobs for GPU prefill streaming
+    # (tools/build_marlin_prefill_cache.py). Lets GGUF/LLAMAFILE deployments —
+    # whose CPU wrapper cannot export GPU-format weights — use the
+    # gpu_prefill_token_threshold fast path. See kt_marlin_prefill.py.
+    prefill_marlin_cache: Optional[str] = None
 
 
 @dataclass
@@ -2099,6 +2105,7 @@ def create_kt_config_from_server_args(
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
         expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
+        prefill_marlin_cache=getattr(server_args, "kt_prefill_marlin_cache", None),
     )
 
 
@@ -2474,6 +2481,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.logical_to_gpu_index_cuda = None
 
         self.gpu_prefill_token_threshold = kt_config.gpu_prefill_token_threshold or 0
+        self.prefill_marlin_cache = kt_config.prefill_marlin_cache
+        # Warn-once flag: the SharedFullContext fallback needs the KT CPU
+        # wrapper to export GPU-format weights; LLAMAFILE (GGUF) cannot.
+        self._warned_layerwise_unsupported = False
         self._full_init_args = None
         self.wrapper: Optional[KTMoEWrapper] = None
 
@@ -2703,6 +2714,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     lora.alpha,
                 )
 
+        # Initialize the bounded Marlin host/GPU rings only after the last KT
+        # layer has loaded its GGUF experts. Doing this from create_weights used
+        # to pin ~380 GiB before LLAMAFILE allocated another ~400 GiB, driving
+        # startup into pathological page-fault and page-release work. Models
+        # whose final layer is not KT simply initialize lazily on first prefill.
+        if (
+            self.tp_rank == 0
+            and self.gpu_prefill_token_threshold > 0
+            and self.prefill_marlin_cache is not None
+            and self.kt_config.num_layers is not None
+            and self.kt_config.layer_idx == self.kt_config.num_layers - 1
+        ):
+            self._get_marlin_prefill_runner(self.gpu_experts_mask_cuda.device)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
@@ -2844,6 +2869,40 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         return self._sync_cpu_forward(staged_hidden_states)
 
+    def _get_marlin_prefill_runner(self, device: torch.device):
+        """Marlin-cache GPU prefill runner (None when unconfigured/unavailable).
+
+        This is the byte source for GPU prefill when the KT CPU wrapper cannot
+        export GPU-format weights (LLAMAFILE/GGUF). TP>1 would require
+        TP-sharded cache blobs, which the offline builder does not produce yet.
+        """
+        if self.prefill_marlin_cache is None:
+            return None
+        tp_size = get_tensor_model_parallel_world_size()
+        pp_size = get_pipeline_model_parallel_world_size()
+        if tp_size > 1 or pp_size > 1:
+            if not self._warned_layerwise_unsupported:
+                logger.warning(
+                    "[KT-marlin-prefill] --kt-prefill-marlin-cache currently "
+                    "supports tensor- and pipeline-parallel size 1 only "
+                    "(got TP=%d, PP=%d); ignoring.",
+                    tp_size,
+                    pp_size,
+                )
+                self._warned_layerwise_unsupported = True
+            return None
+        from sglang.srt.layers.moe.kt_marlin_prefill import (
+            get_marlin_prefill_runner,
+        )
+
+        from sglang.srt.server_args import get_global_server_args
+
+        return get_marlin_prefill_runner(
+            self.prefill_marlin_cache,
+            device,
+            expected_model_path=get_global_server_args().model_path,
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -2878,6 +2937,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        if (
+            os.environ.get("SGLANG_DEBUG_HIDDEN") == "1"
+            and x.shape[0] > 2000
+            and self.kt_config.layer_idx in (63, 64, 65)
+        ):
+            _tw, _ti = topk_output.topk_weights, topk_output.topk_ids
+            _xnan = x.float().isnan().any(dim=-1)
+            _wnan = _tw.float().isnan().any(dim=-1)
+            _bad_ids = ((_ti < -1) | (_ti >= 256)).any(dim=-1)
+            print(
+                f"[MOE] L{self.kt_config.layer_idx} rows={x.shape[0]} "
+                f"x_nan_rows={_xnan.sum().item()}@{_xnan.nonzero().flatten()[:8].tolist()} "
+                f"x_max={x.float().abs().max().item():.3e} "
+                f"w_nan_rows={_wnan.sum().item()}@{_wnan.nonzero().flatten()[:8].tolist()} "
+                f"w_max={_tw.float().abs().max().item():.3e} w_min={_tw.float().min().item():.3e} "
+                f"bad_id_rows={_bad_ids.sum().item()} "
+                f"id_min={_ti.min().item()} id_max={_ti.max().item()}",
+                flush=True,
+            )
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
         _kt_timing = (
             os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
@@ -2907,10 +2985,74 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             or hasattr(layer, "w13_weight_packed")
             or getattr(layer, "_v4_tk_path", False)
         )
+
+        # Marlin-cache GPU prefill (LLAMAFILE-compatible byte source): stream
+        # this layer's full pre-repacked Marlin expert set from pinned host
+        # RAM and run fused_marlin_moe. Takes precedence over the
+        # SharedFullContext fallback because it skips the per-sweep
+        # transpose/repack/permute pipeline and needs no KT wrapper export
+        # APIs. Origin: kt-sglang 耦合 (GLM-5.2 GGUF GPU-prefill engine).
+        if (
+            self.gpu_prefill_token_threshold > 0
+            and num_tokens >= self.gpu_prefill_token_threshold
+            and self.prefill_marlin_cache is not None
+        ):
+            _mp_runner = self._get_marlin_prefill_runner(x.device)
+            if _mp_runner is not None and _mp_runner.cache.has_layer(
+                self.kt_config.layer_idx
+            ):
+                _mp_out = _mp_runner.forward(
+                    layer_idx=self.kt_config.layer_idx,
+                    hidden_states=x,
+                    topk_weights=topk_output.topk_weights,
+                    topk_ids=topk_output.topk_ids,
+                    router_logits=topk_output.router_logits,
+                    # None: forward_normal applies routed scaling once for
+                    # KTEPWrapperMethod (mirrors SharedFullContext).
+                    routed_scaling_factor=None,
+                )
+                # Do not call CUDAEvent.elapsed_time here: the copy/GEMM is
+                # deliberately asynchronous and PyTorch requires both events
+                # to be complete. Synchronizing per layer would also destroy
+                # the H2D/GEMM overlap this path exists to provide.
+                if self.tp_rank == 0 and logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "KT marlin-cache prefill enqueued: layer %d tokens %d",
+                        self.kt_config.layer_idx,
+                        num_tokens,
+                    )
+                return StandardCombineInput(hidden_states=_mp_out)
+
+        # The SharedFullContext fallback additionally needs the KT CPU wrapper
+        # to export GPU-format expert bytes. LLAMAFILE (GGUF) wrappers do not
+        # implement submit_write_weight_scale_to_buffer — previously this
+        # crashed mid-prefill unless the threshold was parked above the
+        # context length; now we warn once and stay on the hybrid path.
+        _wrapper_can_export = self.wrapper is None or hasattr(
+            self.wrapper, "submit_write_weight_scale_to_buffer"
+        )
         if (
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
             and _full_gpu_fallback_supported
+            and not _wrapper_can_export
+            and not self._warned_layerwise_unsupported
+        ):
+            logger.warning(
+                "[KT] gpu_prefill_token_threshold=%d hit with %d tokens but the "
+                "KT CPU wrapper (%s method) does not support layerwise weight "
+                "export and no --kt-prefill-marlin-cache is usable; staying on "
+                "the hybrid CPU-expert path.",
+                self.gpu_prefill_token_threshold,
+                num_tokens,
+                self.kt_config.method,
+            )
+            self._warned_layerwise_unsupported = True
+        if (
+            self.gpu_prefill_token_threshold > 0
+            and num_tokens >= self.gpu_prefill_token_threshold
+            and _full_gpu_fallback_supported
+            and _wrapper_can_export
         ):
             ctx = self._build_full_context(layer)
 

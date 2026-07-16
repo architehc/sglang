@@ -315,7 +315,13 @@ def get_rope_cpu(
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
 
-    assert rope_scaling is not None
+    if rope_scaling is None:
+        rotary_emb = RotaryEmbedding(
+            head_size, rotary_dim, max_position, base, is_neox_style, dtype
+        )
+        _ROPE_DICT[key] = rotary_emb
+        return rotary_emb
+
     scaling_type = rope_scaling["rope_type"]
     assert (
         scaling_type == "deepseek_yarn"

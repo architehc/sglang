@@ -277,6 +277,16 @@ class ModelRunnerKVCacheMixin:
                 kv_lora_rank % quant_block_size == 0
             ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
 
+            if envs.SGLANG_NSA_KV_NVFP4.get():
+                # SGLANG_NSA_KV_NVFP4=1: pool rows hold NVFP4 instead of fp8
+                # (e2m1 nibbles + fp8_e4m3 per-16 block scales + pad);
+                # 328 bytes/token/layer for 512+64 dims vs 656 for fp8.
+                from sglang.srt.layers.attention.nsa.nvfp4_kv_cache import (
+                    nvfp4_row_bytes,
+                )
+
+                return nvfp4_row_bytes(kv_lora_rank, qk_rope_head_dim)
+
             return (
                 kv_lora_rank
                 + kv_lora_rank // quant_block_size * 4

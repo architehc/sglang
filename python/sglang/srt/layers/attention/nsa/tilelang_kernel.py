@@ -1,4 +1,6 @@
 import functools
+import logging
+import os
 from typing import Any, Optional, Tuple
 
 import tilelang
@@ -25,6 +27,8 @@ FP32 = "float32"
 INT32 = "int32"
 
 _is_hip = is_hip()
+
+logger = logging.getLogger(__name__)
 
 
 def fast_log2_ceil(x):
@@ -223,6 +227,7 @@ def sparse_attention_fwd_kernel_v1(
     block_I=64,
     num_stages=2,
     threads=256,
+    kv_dtype="bfloat16",
 ):
     assert dim == tilelang.math.next_power_of_2(
         dim
@@ -261,18 +266,30 @@ def sparse_attention_fwd_kernel_v1(
     D = dim
     D_tail = tail_dim
 
-    if head_kv > 64:
-        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
-        REPLICATE_H = head_kv // 64
+    # sm_120 (workstation Blackwell) has only ~99KB dynamic smem per block vs
+    # Hopper's 228KB. Split heads into smaller per-block groups so
+    # Q_shared (H_per_block x 576 x 2B) + KV_shared (block_I x 576 x 2B) fits.
+    _h_split = 64
+    try:
+        import torch as _t
+
+        if _t.cuda.get_device_capability()[0] >= 12:
+            _h_split = 16
+    except Exception:
+        pass
+
+    if head_kv > _h_split:
+        assert head_kv % _h_split == 0, "head_kv should be a multiple of the head split"
+        REPLICATE_H = head_kv // _h_split
     else:
         REPLICATE_H = 1
 
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    H_per_block = padded_H if REPLICATE_H == 1 else _h_split
 
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
-        KV: T.Tensor(kv_shape, dtype),  # type: ignore
+        KV: T.Tensor(kv_shape, kv_dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
@@ -306,7 +323,7 @@ def sparse_attention_fwd_kernel_v1(
             q_i = s_i
             max_kv_i = q_i
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
+            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block)
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
@@ -369,6 +386,733 @@ def sparse_attention_fwd_kernel_v1(
 
             T.copy(acc_o, O_shared)
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+
+    return main
+
+
+# ---------------------------------------------------------------------------
+# sm_120 smem-geometry variants for sparse_attention_fwd_kernel_v1
+# Selected via env var SGLANG_NSA_TILELANG_GEOM = h16 (default) | h32 | h32ds
+# | h32p.
+#
+# Shared-memory budget (bytes, bf16 tiles, single-buffered i.e. num_stages=1).
+# All gemm operand tiles are bf16 even on the fp8-KV path: the indexed gather
+# copy casts fp8 -> bf16 elementwise into KV_shared/K_tail_shared. Accumulators
+# (acc_o, acc_s) and softmax stats (m_i, sumexp, alpha, ...) are register
+# fragments, not smem. O_shared in v1 is dead (acc_o is copied straight to
+# global) and is eliminated by the compiler, so it is excluded below.
+# sm_120 opt-in cap: 99 KB / block = 101,376 B. Hopper (v2 path): 228 KB.
+#
+#  Geometry                     Q      Q_tail KV      K_tail S     total    fits?
+#  h16  H16 BI64 full-D (cur)   16,384  2,048 65,536   8,192 2,048  94,208  yes (7,168 free)
+#  h16  BI64 num_stages=2       16,384  2,048 131,072 16,384 2,048 167,936  NO
+#  h32  H32 BI64 full-D naive   32,768  4,096 65,536   8,192 4,096 114,688  NO (over by 13,312)
+#  h32  H32 BI32 full-D (impl)  32,768  4,096 32,768   4,096 2,048  75,776  yes (25,600 free)
+#  h32ds H32 BI64 D-split 2x256 32,768* 4,096 32,768** 8,192 4,096  81,920  yes (19,456 free)
+#  h32ds + double-buffered half 32,768  4,096 65,536   8,192 4,096 114,688  NO
+#  h32p H32 BI32 2-stage full-D 32,768  4,096 65,536  8,192  2,048 112,640  NO (over by 11,264)
+#  h32p H32 BI32 prefetch(impl) 32,768* 4,096 49,152*** 8,192**** 2,048 96,256 yes (5,120 free)
+#  h64  H64 BI64 full-D         65,536  8,192 65,536   8,192 8,192 155,648  NO
+#   *  as two [H,256] halves (needed as separate tiles for the half gemms)
+#   ** one [64,256] half-buffer reused 4x/iter: K half0, K half1, V half0, V half1
+#   *** KV_l [32,256] pipelined 2 versions (32,768) + KV_r [32,256] single
+#       version (16,384): the pipeline planner double-buffers the pure-copy
+#       gathers (KV_l, K_tail); KV_r uses a predicated store so it stays a
+#       consumer-stage, single-buffered gather (see h32p docstring)
+#   **** K_tail [32,64] pipelined 2 versions
+#  (The "2x288 incl. tail" split from the design note lands at 77,824 B; the
+#   2x256 + separate 64-tail form used here keeps power-of-2 gemm K-dims and
+#   reuses v1's proven tail-gemm structure at nearly the same footprint.)
+#
+# Warp partitioning (tilelang MMA path on sm_120; see tilelang
+# src/cuda/op/gemm.cc ComputeDefaultWarpPartition with k_n_per_warp=8 and
+# cuda/intrinsics/macro/mma_macro_generator.py assert warp_row_tiles >= 16):
+# every T.gemm needs M / m_warp >= 16 (and % 16 == 0). Under FullCol, m_warp
+# stays 1 only while N % (n_warp * 8) == 0; otherwise warps spill to rows:
+# m_warp = num_warps // (N // 8). That is the earlier H16 + threads=256
+# failure ('warp_row >= 16'): any row-spill leaves warp_row_tiles = 16/m_warp
+# = 8. With H32 even m_warp = 2 still yields 16, so both variants below are
+# safe at threads=256 (8 warps):
+#   h32   QK/tail gemm M=32 N=32:  n_warp = 32//8 = 4, m_warp = 2 -> rows 16 OK
+#         PV gemm      M=32 N=512: n_warp = 8, m_warp = 1        -> rows 32 OK
+#   h32ds QK-half gemm M=32 N=64:  n_warp = 8, m_warp = 1        -> rows 32 OK
+#         PV-half gemm M=32 N=256: n_warp = 8, m_warp = 1        -> rows 32 OK
+#   h32p  QK gemms M=32 N=32 (K=256/256/64) and PV-half gemms M=32 N=256:
+#         all shapes identical to h32/h32ds rows above               -> OK
+#         (a BI=16 sub-tile pipeline would need a QK gemm N=16: n_warp = 2,
+#          m_warp = 4 -> rows 8, ILLEGAL at threads=256; hence the D-split
+#          copy granularity instead of token-split, see h32p docstring)
+# threads=128 would satisfy the MMA constraints too but puts acc_o
+# (32x512 fp32 = 64 KB of accumulators) at 128 regs/thread before operands,
+# guaranteeing spills; threads=256 halves that to 64 regs/thread.
+#
+# Why these two variants:
+#   h32   halves REPLICATE_H (4 -> 2 CTAs for decode), so total indexed-gather
+#         traffic and per-KV-byte smem fills halve; every KV element loaded is
+#         used by 32 heads instead of 16 (2x MMA work per smem byte). BI drops
+#         64 -> 32 to fit; softmax runs 2x as often (64 vs 32 iterations).
+#   h32ds keeps BI=64 (fewer, larger softmax steps and wider gemm-K) but must
+#         re-read the 512 V dims per iteration through the reused half-buffer:
+#         per-CTA gather cols/iter = 512(K) + 64(tail) + 512(V) = 1088 vs 576,
+#         i.e. total gather traffic ~ h16 (2 x 1088 vs 4 x 576) with 2x MMA
+#         utilization per block.
+#   h32p  is h32 plus software pipelining of the indexed gather
+#         (T.Pipelined num_stages=2): 320 of the 576 gathered cols/iter
+#         (KV_l + tail, 56% of bytes) are fetched two iterations ahead into
+#         planner-double-buffered tiles and overlap the previous tile's
+#         gemms/softmax; the other 256 cols (KV_r) stay a single-buffered
+#         consumer-stage load (full double-buffering does not fit, see table).
+#         Same gather traffic and softmax count as h32.
+# ---------------------------------------------------------------------------
+
+
+@tilelang.jit(
+    out_idx=[-1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
+def sparse_attention_fwd_kernel_v1_h32(
+    num_heads,
+    dim,
+    tail_dim,
+    topk,
+    *,
+    kv_group=1,
+    sm_scale=None,
+    is_causal=True,
+    block_I=32,
+    num_stages=1,
+    threads=256,
+    kv_dtype="bfloat16",
+):
+    """H32 full-D variant of v1 for sm_120 (see geometry table above).
+
+    H_per_block=32, block_I=32 so the full 576-dim KV tile fits in 99KB smem
+    single-buffered. Structure is byte-for-byte v1 apart from the geometry.
+    """
+    assert dim == tilelang.math.next_power_of_2(
+        dim
+    ), f"haven't check padding correctness yet, dim={dim}"
+    assert tail_dim == tilelang.math.next_power_of_2(
+        tail_dim
+    ), f"haven't check padding correctness yet, dim={tail_dim}"
+    assert is_causal == True, "non-casual is not supported"
+    assert (
+        topk % block_I == 0
+    ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
+    if sm_scale is None:
+        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
+    else:
+        sm_scale = sm_scale * 1.44269504  # log2(e)
+
+    batch = T.symbolic("batch")
+    seq_len = T.symbolic("seq_len")
+    seq_len_kv = T.symbolic("seq_len_kv")
+
+    head_kv = num_heads // kv_group
+    q_shape = [batch, seq_len, num_heads, dim + tail_dim]
+    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
+    o_shape = [batch, seq_len, num_heads, dim]
+    indices_shape = [batch, seq_len, kv_group, topk]
+    indices_dtype = "int32"
+    dtype = "bfloat16"
+    accum_dtype = "float"
+
+    H = head_kv
+    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
+    if padded_H != H:
+        assert kv_group == 1
+    BI = block_I
+    NI = tilelang.cdiv(topk, block_I)
+    D = dim
+    D_tail = tail_dim
+
+    _h_split = 32
+    if head_kv > _h_split:
+        assert head_kv % _h_split == 0, "head_kv should be a multiple of the head split"
+        REPLICATE_H = head_kv // _h_split
+    else:
+        REPLICATE_H = 1
+
+    H_per_block = padded_H if REPLICATE_H == 1 else _h_split
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor(q_shape, dtype),  # type: ignore
+        KV: T.Tensor(kv_shape, kv_dtype),  # type: ignore
+        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        Output: T.Tensor(o_shape, dtype),  # type: ignore
+    ):
+        with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
+            bx,
+            by,
+            bz,
+        ):
+            Q_shared = T.alloc_shared([H_per_block, D], dtype)
+            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
+            KV_shared = T.alloc_shared([BI, D], dtype)
+            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            mask = T.alloc_fragment([BI], "bool")
+
+            acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
+            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
+            S_shared = T.alloc_shared([H_per_block, BI], dtype)
+            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
+            alpha = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+
+            T.fill(acc_o, 0)
+            T.fill(sumexp, 0)
+            T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
+
+            b_i, g_i = by, bz
+            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
+            q_i = s_i
+            max_kv_i = q_i
+
+            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block)
+            H1 = H0 + H_per_block
+
+            T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
+            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+
+            for i_i in T.Pipelined(NI, num_stages=num_stages):
+
+                for bi_i in T.Parallel(BI):
+                    mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
+
+                for bi_i, d_i in T.Parallel(BI, D):
+                    KV_shared[bi_i, d_i] = KV[
+                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
+                    ]
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    K_tail_shared[bi_i, d_i] = KV[
+                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i
+                    ]
+
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.if_then_else(
+                        mask[bi_i], 0, -T.infinity(acc_s.dtype)
+                    )
+                T.gemm(
+                    Q_shared,
+                    KV_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                T.gemm(
+                    Q_tail_shared,
+                    K_tail_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                T.copy(m_i, m_i_prev)
+                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for h_i in T.Parallel(H_per_block):
+                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.exp2(
+                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                    )
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                for h_i in T.Parallel(H_per_block):
+                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                for h_i, d_i in T.Parallel(H_per_block, D):
+                    acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
+
+                T.copy(acc_s, S_shared)
+                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+
+            # Rescale
+            for h_i, d_i in T.Parallel(H_per_block, D):
+                acc_o[h_i, d_i] /= sumexp[h_i]
+            for h_i in T.Parallel(H_per_block):
+                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+
+            T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+
+    return main
+
+
+@tilelang.jit(
+    out_idx=[-1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
+def sparse_attention_fwd_kernel_v1_h32ds(
+    num_heads,
+    dim,
+    tail_dim,
+    topk,
+    *,
+    kv_group=1,
+    sm_scale=None,
+    is_causal=True,
+    block_I=64,
+    threads=256,
+    kv_dtype="bfloat16",
+):
+    """H32 D-split variant of v1 for sm_120 (see geometry table above).
+
+    H_per_block=32, block_I=64. The 512 main dims go through one reused
+    [BI, 256] half-buffer, loaded 4x per iteration (K half0/half1 for the
+    score gemms, then V half0/half1 for the PV gemms after softmax). The
+    64-dim tail keeps its own buffer as in v1. Uses T.serial (not
+    T.Pipelined) so the pipeline planner cannot reorder the four sequential
+    writes to the shared half-buffer; tilelang's thread-sync pass inserts
+    the RAW/WAR barriers around each load/gemm pair.
+    """
+    assert dim == tilelang.math.next_power_of_2(
+        dim
+    ), f"haven't check padding correctness yet, dim={dim}"
+    assert dim % 2 == 0, f"D-split needs even dim, dim={dim}"
+    assert tail_dim == tilelang.math.next_power_of_2(
+        tail_dim
+    ), f"haven't check padding correctness yet, dim={tail_dim}"
+    assert is_causal == True, "non-casual is not supported"
+    assert (
+        topk % block_I == 0
+    ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
+    if sm_scale is None:
+        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
+    else:
+        sm_scale = sm_scale * 1.44269504  # log2(e)
+
+    batch = T.symbolic("batch")
+    seq_len = T.symbolic("seq_len")
+    seq_len_kv = T.symbolic("seq_len_kv")
+
+    head_kv = num_heads // kv_group
+    q_shape = [batch, seq_len, num_heads, dim + tail_dim]
+    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
+    o_shape = [batch, seq_len, num_heads, dim]
+    indices_shape = [batch, seq_len, kv_group, topk]
+    indices_dtype = "int32"
+    dtype = "bfloat16"
+    accum_dtype = "float"
+
+    H = head_kv
+    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
+    if padded_H != H:
+        assert kv_group == 1
+    BI = block_I
+    NI = tilelang.cdiv(topk, block_I)
+    D = dim
+    DH = dim // 2
+    D_tail = tail_dim
+
+    _h_split = 32
+    if head_kv > _h_split:
+        assert head_kv % _h_split == 0, "head_kv should be a multiple of the head split"
+        REPLICATE_H = head_kv // _h_split
+    else:
+        REPLICATE_H = 1
+
+    H_per_block = padded_H if REPLICATE_H == 1 else _h_split
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor(q_shape, dtype),  # type: ignore
+        KV: T.Tensor(kv_shape, kv_dtype),  # type: ignore
+        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        Output: T.Tensor(o_shape, dtype),  # type: ignore
+    ):
+        with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
+            bx,
+            by,
+            bz,
+        ):
+            Q_shared_l = T.alloc_shared([H_per_block, DH], dtype)
+            Q_shared_r = T.alloc_shared([H_per_block, DH], dtype)
+            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
+            KV_half_shared = T.alloc_shared([BI, DH], dtype)
+            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            mask = T.alloc_fragment([BI], "bool")
+
+            acc_o_l = T.alloc_fragment([H_per_block, DH], accum_dtype)
+            acc_o_r = T.alloc_fragment([H_per_block, DH], accum_dtype)
+            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
+            S_shared = T.alloc_shared([H_per_block, BI], dtype)
+            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
+            alpha = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+
+            T.fill(acc_o_l, 0)
+            T.fill(acc_o_r, 0)
+            T.fill(sumexp, 0)
+            T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
+
+            b_i, g_i = by, bz
+            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
+
+            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block)
+            H1 = H0 + H_per_block
+
+            T.copy(Q[b_i, s_i, H0:H1, 0:DH], Q_shared_l)
+            T.copy(Q[b_i, s_i, H0:H1, DH:D], Q_shared_r)
+            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+
+            for i_i in T.serial(NI):
+
+                for bi_i in T.Parallel(BI):
+                    mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
+
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.if_then_else(
+                        mask[bi_i], 0, -T.infinity(acc_s.dtype)
+                    )
+
+                # K pass, half 0: columns [0, DH)
+                for bi_i, d_i in T.Parallel(BI, DH):
+                    KV_half_shared[bi_i, d_i] = KV[
+                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
+                    ]
+                T.gemm(
+                    Q_shared_l,
+                    KV_half_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                # K pass, half 1: columns [DH, D)
+                for bi_i, d_i in T.Parallel(BI, DH):
+                    KV_half_shared[bi_i, d_i] = KV[
+                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, DH + d_i
+                    ]
+                T.gemm(
+                    Q_shared_r,
+                    KV_half_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                # tail
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    K_tail_shared[bi_i, d_i] = KV[
+                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i
+                    ]
+                T.gemm(
+                    Q_tail_shared,
+                    K_tail_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+
+                T.copy(m_i, m_i_prev)
+                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for h_i in T.Parallel(H_per_block):
+                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.exp2(
+                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                    )
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                for h_i in T.Parallel(H_per_block):
+                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                for h_i, d_i in T.Parallel(H_per_block, DH):
+                    acc_o_l[h_i, d_i] = acc_o_l[h_i, d_i] * alpha[h_i]
+                for h_i, d_i in T.Parallel(H_per_block, DH):
+                    acc_o_r[h_i, d_i] = acc_o_r[h_i, d_i] * alpha[h_i]
+
+                T.copy(acc_s, S_shared)
+
+                # V pass, half 0: reload columns [0, DH)
+                for bi_i, d_i in T.Parallel(BI, DH):
+                    KV_half_shared[bi_i, d_i] = KV[
+                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
+                    ]
+                T.gemm(
+                    S_shared,
+                    KV_half_shared,
+                    acc_o_l,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                # V pass, half 1: reload columns [DH, D)
+                for bi_i, d_i in T.Parallel(BI, DH):
+                    KV_half_shared[bi_i, d_i] = KV[
+                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, DH + d_i
+                    ]
+                T.gemm(
+                    S_shared,
+                    KV_half_shared,
+                    acc_o_r,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+
+            # Rescale
+            for h_i, d_i in T.Parallel(H_per_block, DH):
+                acc_o_l[h_i, d_i] /= sumexp[h_i]
+            for h_i, d_i in T.Parallel(H_per_block, DH):
+                acc_o_r[h_i, d_i] /= sumexp[h_i]
+            for h_i in T.Parallel(H_per_block):
+                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+
+            T.copy(acc_o_l, Output[b_i, s_i, H0:H1, 0:DH])
+            T.copy(acc_o_r, Output[b_i, s_i, H0:H1, DH:D])
+
+    return main
+
+
+@tilelang.jit(
+    out_idx=[-1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
+def sparse_attention_fwd_kernel_v1_h32p(
+    num_heads,
+    dim,
+    tail_dim,
+    topk,
+    *,
+    kv_group=1,
+    sm_scale=None,
+    is_causal=True,
+    block_I=32,
+    num_stages=2,
+    threads=256,
+    kv_dtype="bfloat16",
+):
+    """H32 prefetch ('h32p') variant of v1 for sm_120 (see geometry table above).
+
+    Same H32/BI32 compute geometry as h32, but the indexed KV gather is
+    software-pipelined via T.Pipelined(num_stages=2) so the gather of tile
+    i+2 overlaps the QK/softmax/PV work on tile i (planner route, not manual
+    double-buffering: tilelang's pipeline planner classifies raw elementwise
+    global->shared gathers as stage-0 copy stages -- BufferStore whose value
+    reads a global buffer, incl. through a Cast, see pipeline_planning.cc
+    BufferRegionCollector / IsPureCopyStmt -- and inject_pipeline.cc then
+    multi-buffers those shared tiles, exactly as upstream v1 does with
+    num_stages=2 on Hopper).
+
+    Structure choice (why not the 2x16-token sub-tile design):
+      * BI=16 sub-tiles would shrink the QK gemm to N=16, and at threads=256
+        (8 warps) FullCol then spills warps to rows (m_warp=4 ->
+        warp_row_tiles=8), violating the mma_macro_generator assert
+        warp_row_tiles >= 16. threads=128 would fix the partition but puts
+        acc_o (32x512 fp32) at 128 regs/thread => guaranteed spills. It would
+        also double the softmax count to 128 iterations.
+      * A full double buffer of the whole [32, 576] tile needs 73,728 B of
+        stage buffers; only 62,464 B remain beside Q/S, so it cannot fit
+        (see table: 112,640 B total).
+    So the compute tile stays BI=32 (64 softmax iterations, all gemm shapes
+    identical to proven h32/h32ds shapes) and the tile is D-split for the
+    copy only: the first 256 main dims + the 64 tail dims (320/576 = 56% of
+    the gather bytes) are pure-copy gathers that the planner prefetches and
+    double-buffers; the remaining 256 main dims (KV_r) are gathered with a
+    T.if_then_else-predicated store, which IsPureCopyStmt rejects as a copy
+    stage, so KV_r stays in the consumer stage with a single buffer and only
+    gets intra-iteration load/compute overlap. The predicate (index >= 0) is
+    data-dependent (unfoldable) and semantically a no-op: masked rows score
+    exp2(-inf) = 0 in S, so their V contribution is 0 either way (writing 0
+    instead of the index=-1 garbage row is strictly safer).
+
+    fp8 KV keeps the elementwise fp8->bf16 cast inside all three gathers.
+    Note cp.async cannot carry a dtype conversion, so on the fp8 path the
+    prefetch overlap relies on the pipeline's issue-order (ld.global for
+    tile i+2 issued before tile i's gemms) rather than hardware async
+    copies; the bf16 path can additionally be lowered to cp.async.
+    """
+    assert dim == tilelang.math.next_power_of_2(
+        dim
+    ), f"haven't check padding correctness yet, dim={dim}"
+    assert dim % 2 == 0, f"D-split needs even dim, dim={dim}"
+    assert tail_dim == tilelang.math.next_power_of_2(
+        tail_dim
+    ), f"haven't check padding correctness yet, dim={tail_dim}"
+    assert is_causal == True, "non-casual is not supported"
+    assert (
+        topk % block_I == 0
+    ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
+    if sm_scale is None:
+        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
+    else:
+        sm_scale = sm_scale * 1.44269504  # log2(e)
+
+    batch = T.symbolic("batch")
+    seq_len = T.symbolic("seq_len")
+    seq_len_kv = T.symbolic("seq_len_kv")
+
+    head_kv = num_heads // kv_group
+    q_shape = [batch, seq_len, num_heads, dim + tail_dim]
+    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
+    o_shape = [batch, seq_len, num_heads, dim]
+    indices_shape = [batch, seq_len, kv_group, topk]
+    indices_dtype = "int32"
+    dtype = "bfloat16"
+    accum_dtype = "float"
+
+    H = head_kv
+    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
+    if padded_H != H:
+        assert kv_group == 1
+    BI = block_I
+    NI = tilelang.cdiv(topk, block_I)
+    D = dim
+    DH = dim // 2
+    D_tail = tail_dim
+
+    _h_split = 32
+    if head_kv > _h_split:
+        assert head_kv % _h_split == 0, "head_kv should be a multiple of the head split"
+        REPLICATE_H = head_kv // _h_split
+    else:
+        REPLICATE_H = 1
+
+    H_per_block = padded_H if REPLICATE_H == 1 else _h_split
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor(q_shape, dtype),  # type: ignore
+        KV: T.Tensor(kv_shape, kv_dtype),  # type: ignore
+        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        Output: T.Tensor(o_shape, dtype),  # type: ignore
+    ):
+        with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
+            bx,
+            by,
+            bz,
+        ):
+            Q_shared_l = T.alloc_shared([H_per_block, DH], dtype)
+            Q_shared_r = T.alloc_shared([H_per_block, DH], dtype)
+            Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
+            # Prefetched (pipeline stage 0, 2 versions each after planning):
+            KV_l_shared = T.alloc_shared([BI, DH], dtype)
+            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            # Consumer-stage gather (single version, predicated store below):
+            KV_r_shared = T.alloc_shared([BI, DH], dtype)
+            mask = T.alloc_fragment([BI], "bool")
+
+            acc_o_l = T.alloc_fragment([H_per_block, DH], accum_dtype)
+            acc_o_r = T.alloc_fragment([H_per_block, DH], accum_dtype)
+            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
+            S_shared = T.alloc_shared([H_per_block, BI], dtype)
+            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
+            alpha = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+
+            T.fill(acc_o_l, 0)
+            T.fill(acc_o_r, 0)
+            T.fill(sumexp, 0)
+            T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
+
+            b_i, g_i = by, bz
+            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
+
+            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block)
+            H1 = H0 + H_per_block
+
+            T.copy(Q[b_i, s_i, H0:H1, 0:DH], Q_shared_l)
+            T.copy(Q[b_i, s_i, H0:H1, DH:D], Q_shared_r)
+            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+
+            for i_i in T.Pipelined(NI, num_stages=num_stages):
+
+                for bi_i in T.Parallel(BI):
+                    mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
+
+                # Pure gathers -> planner copy stage (prefetched + versioned).
+                for bi_i, d_i in T.Parallel(BI, DH):
+                    KV_l_shared[bi_i, d_i] = KV[
+                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
+                    ]
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    K_tail_shared[bi_i, d_i] = KV[
+                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i
+                    ]
+                # Predicated gather -> NOT a pure copy (if_then_else value),
+                # so it stays in the consumer stage, single-buffered. Do not
+                # "simplify" the predicate away: it is what keeps this store
+                # out of the pipeline copy stage (smem would not fit a third
+                # double-buffered tile).
+                for bi_i, d_i in T.Parallel(BI, DH):
+                    KV_r_shared[bi_i, d_i] = T.if_then_else(
+                        Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0,
+                        KV[
+                            b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, DH + d_i
+                        ].astype(dtype),
+                        T.Cast(dtype, 0),
+                    )
+
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.if_then_else(
+                        mask[bi_i], 0, -T.infinity(acc_s.dtype)
+                    )
+                T.gemm(
+                    Q_shared_l,
+                    KV_l_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                T.gemm(
+                    Q_shared_r,
+                    KV_r_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                T.gemm(
+                    Q_tail_shared,
+                    K_tail_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                T.copy(m_i, m_i_prev)
+                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for h_i in T.Parallel(H_per_block):
+                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.exp2(
+                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                    )
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                for h_i in T.Parallel(H_per_block):
+                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                for h_i, d_i in T.Parallel(H_per_block, DH):
+                    acc_o_l[h_i, d_i] = acc_o_l[h_i, d_i] * alpha[h_i]
+                for h_i, d_i in T.Parallel(H_per_block, DH):
+                    acc_o_r[h_i, d_i] = acc_o_r[h_i, d_i] * alpha[h_i]
+
+                T.copy(acc_s, S_shared)
+                T.gemm(
+                    S_shared,
+                    KV_l_shared,
+                    acc_o_l,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                T.gemm(
+                    S_shared,
+                    KV_r_shared,
+                    acc_o_r,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+
+            # Rescale
+            for h_i, d_i in T.Parallel(H_per_block, DH):
+                acc_o_l[h_i, d_i] /= sumexp[h_i]
+            for h_i, d_i in T.Parallel(H_per_block, DH):
+                acc_o_r[h_i, d_i] /= sumexp[h_i]
+            for h_i in T.Parallel(H_per_block):
+                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+
+            T.copy(acc_o_l, Output[b_i, s_i, H0:H1, 0:DH])
+            T.copy(acc_o_r, Output[b_i, s_i, H0:H1, DH:D])
 
     return main
 
@@ -530,17 +1274,16 @@ def sparse_attention_fwd_kernel_v2(
                             is_kv_valid_0[bi_i], 0, -T.infinity(acc_s.dtype)
                         )
                     T.gemm(
-                        Q_shared_l, KV_shared_0_l, acc_s, transpose_B=True, wg_wait=-1
+                        Q_shared_l, KV_shared_0_l, acc_s, transpose_B=True
                     )
                     T.gemm(
-                        Q_shared_r, KV_shared_0_r, acc_s, transpose_B=True, wg_wait=-1
+                        Q_shared_r, KV_shared_0_r, acc_s, transpose_B=True
                     )
                     T.gemm(
                         Q_tail_shared,
                         K_tail_shared_0,
                         acc_s,
                         transpose_B=True,
-                        wg_wait=-1,
                     )
 
                     T.wait_wgmma(0)
@@ -582,17 +1325,16 @@ def sparse_attention_fwd_kernel_v2(
                             is_kv_valid_1[bi_i], 0, -T.infinity(acc_s.dtype)
                         )
                     T.gemm(
-                        Q_shared_l, KV_shared_1_l, acc_s, transpose_B=True, wg_wait=-1
+                        Q_shared_l, KV_shared_1_l, acc_s, transpose_B=True
                     )
                     T.gemm(
-                        Q_shared_r, KV_shared_1_r, acc_s, transpose_B=True, wg_wait=-1
+                        Q_shared_r, KV_shared_1_r, acc_s, transpose_B=True
                     )
                     T.gemm(
                         Q_tail_shared,
                         K_tail_shared_1,
                         acc_s,
                         transpose_B=True,
-                        wg_wait=-1,
                     )
 
                     T.wait_wgmma(0)
@@ -1005,6 +1747,20 @@ def sparse_mla_fwd_decode_combine(
     return main
 
 
+@functools.cache
+def _nsa_tilelang_geom() -> str:
+    """sm_120 smem-geometry selector: SGLANG_NSA_TILELANG_GEOM = h16|h32|h32ds|h32p."""
+    geom = os.environ.get("SGLANG_NSA_TILELANG_GEOM", "h16").strip().lower()
+    if geom not in ("h16", "h32", "h32ds", "h32p"):
+        logger.warning(
+            "Unknown SGLANG_NSA_TILELANG_GEOM=%r, falling back to h16", geom
+        )
+        geom = "h16"
+    if geom != "h16":
+        logger.info("NSA tilelang sparse-fwd smem geometry: %s", geom)
+    return geom
+
+
 def tilelang_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -1018,10 +1774,36 @@ def tilelang_sparse_fwd(
     tail_dim = dim - d_v
     topk = indices.shape[-1]
     assert topk == 2048
-    if _is_hip:
-        kernel = sparse_attention_fwd_kernel_v1(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
-        )
+    import torch as _t
+
+    _small_smem = (not _is_hip) and _t.cuda.get_device_capability()[0] >= 12
+    if _is_hip or _small_smem:
+        # v2's tiles need ~226KB dynamic smem (Hopper/SM100). sm_120 workstation
+        # Blackwell caps at ~99KB per block; v1 with num_stages=1 fits.
+        kv_dtype = "float8_e4m3" if kv.dtype == torch.float8_e4m3fn else "bfloat16"
+        # Optional sm_120 smem-geometry override (see table above the h32
+        # kernels): h16 (default, current path) | h32 | h32ds | h32p.
+        geom = _nsa_tilelang_geom() if _small_smem else "h16"
+        if geom == "h32":
+            kernel = sparse_attention_fwd_kernel_v1_h32(
+                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale,
+                kv_dtype=kv_dtype,
+            )
+        elif geom == "h32ds":
+            kernel = sparse_attention_fwd_kernel_v1_h32ds(
+                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale,
+                kv_dtype=kv_dtype,
+            )
+        elif geom == "h32p":
+            kernel = sparse_attention_fwd_kernel_v1_h32p(
+                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale,
+                kv_dtype=kv_dtype,
+            )
+        else:
+            kernel = sparse_attention_fwd_kernel_v1(
+                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1,
+                threads=128, kv_dtype=kv_dtype,
+            )
     else:
         kernel = sparse_attention_fwd_kernel_v2(
             num_heads, d_v, tail_dim, topk, sm_scale=sm_scale

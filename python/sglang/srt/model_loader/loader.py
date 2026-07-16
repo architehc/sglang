@@ -8,6 +8,7 @@ import dataclasses
 import fnmatch
 import gc
 import glob
+import inspect
 import json
 import logging
 import math
@@ -113,6 +114,7 @@ from sglang.srt.utils import (
     rank0_log,
     set_weight_attrs,
 )
+from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -532,9 +534,17 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = pt_weights_iterator(hf_weights_files)
 
         if self.load_config.draft_model_idx is not None:
-            return self._filter_mtp_weights(
+            weights_iterator = self._filter_mtp_weights(
                 weights_iterator, source.prefix, self.load_config.draft_model_idx
             )
+
+        # When KTransformers CPUInfer is configured to keep *all* experts on CPU
+        # (--kt-weight-path set and --kt-num-gpu-experts 0), the sglang model
+        # loader does not need to materialize the routed expert weights. They
+        # will be loaded directly from disk by the KT NativeMoEWrapper. Skipping
+        # them here avoids a large duplicate copy of the expert MLP weights in
+        # host memory during sglang's load_weights pass.
+        weights_iterator = _maybe_filter_kt_cpu_expert_weights(weights_iterator)
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
@@ -666,8 +676,26 @@ class DefaultModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
+
+        server_args = get_global_server_args()
+        use_cpu_init = (
+            server_args is not None
+            and target_device.type != "cpu"
+            and (
+                server_args.cpu_offload_gb > 0
+                or server_args.offload_group_size > 0
+            )
+        )
+        init_device = torch.device("cpu") if use_cpu_init else target_device
+        if use_cpu_init:
+            logger.info(
+                "Layer offloading requested: initializing model on CPU to avoid allocating "
+                "offloaded weights on %s first.",
+                target_device,
+            )
+
         with set_default_torch_dtype(model_config.dtype):
-            with target_device:
+            with init_device:
                 model = _initialize_model(
                     model_config,
                     self.load_config,
@@ -675,15 +703,71 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
             self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                model,
+                self._get_all_weights(model_config, model),
+                target_device,
+                model_config,
+                defer_post_load=use_cpu_init,
             )
+
+        if use_cpu_init:
+            # OffloaderV1/V2 only install forward hooks and mark offloaded modules;
+            # weights that are not offloaded were created on CPU and need to be
+            # moved to the inference device now.
+            offloaded_param_ids = set()
+            for module in model.modules():
+                if getattr(module, "_sglang_offloaded", False):
+                    offloaded_param_ids.update(
+                        id(p) for p in module.parameters(recurse=True)
+                    )
+            moved_params = 0
+            kept_params = 0
+            for p in model.parameters():
+                if id(p) not in offloaded_param_ids:
+                    p.data = p.data.to(target_device)
+                    moved_params += 1
+                else:
+                    kept_params += 1
+            logger.info(
+                "Moved %d non-offloaded parameters to %s; kept %d offloaded parameters on CPU.",
+                moved_params,
+                target_device,
+                kept_params,
+            )
+            for b in model.buffers():
+                b.data = b.data.to(target_device)
+
+        # For CPU-offload loads, post_load_weights was deferred until the
+        # non-offloaded parameters reached the inference device.
+        if (
+            use_cpu_init
+            and "run_post_load" in inspect.signature(model.load_weights).parameters
+            and model_config is not None
+        ):
+            post_load_weights(model, model_config)
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
     @staticmethod
-    def load_weights_and_postprocess(model, weights, target_device):
-        model.load_weights(weights)
+    def load_weights_and_postprocess(
+        model,
+        weights,
+        target_device,
+        model_config=None,
+        defer_post_load: bool = False,
+    ):
+        # DeepSeek-style loaders support deferring post_load_weights until
+        # after quantization methods have processed their weights (e.g.,
+        # INT4/Marlin repacking that populates scheme attribute names).
+        supports_deferred_post_load = (
+            "run_post_load"
+            in inspect.signature(model.load_weights).parameters
+        )
+        if supports_deferred_post_load:
+            model.load_weights(weights, run_post_load=False)
+        else:
+            model.load_weights(weights)
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
@@ -697,6 +781,61 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_method.process_weights_after_loading(module)
                 if _is_npu:
                     torch.npu.empty_cache()
+
+        if (
+            supports_deferred_post_load
+            and model_config is not None
+            and not defer_post_load
+        ):
+            post_load_weights(model, model_config)
+
+
+def _maybe_filter_kt_cpu_expert_weights(
+    weights_iterator: Generator[Tuple[str, torch.Tensor], None, None],
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Skip routed expert weights when KT will load them on CPU.
+
+    If --kt-weight-path is set and --kt-num-gpu-experts is 0, every routed
+    expert is handled by KTransformers' CPUInfer. The weights will be loaded
+    directly from --kt-weight-path by NativeMoEWrapper, so sglang does not need
+    to copy them during its own load_weights pass. Skipping them here reduces
+    peak host memory by the size of the routed expert MLP weights.
+
+    We keep shared experts, gate/router weights, norms, attention, and
+    embeddings. Only per-expert gate/up/down weights and their scales are
+    dropped.
+    """
+    server_args = get_global_server_args()
+    if (
+        getattr(server_args, "kt_weight_path", None) is None
+        or getattr(server_args, "kt_num_gpu_experts", None) != 0
+    ):
+        yield from weights_iterator
+        return
+
+    # Matches common routed expert weight patterns, including DeepSeek/GLM
+    # (mlp.experts.N.{gate,up,down}_proj.{weight,weight_scale_inv,...}) and
+    # Mixtral/Mistral (block_sparse_moe.experts.N.{w1,w3,w2}.weight*).
+    _KT_CPU_EXPERT_RE = re.compile(
+        r"(^|.*\.)(mlp\.experts|block_sparse_moe\.experts|\.experts)\.\d+\.(gate_proj|up_proj|down_proj|w1|w3|w2)\..*"
+    )
+
+    skipped = 0
+    skipped_bytes = 0
+    for name, tensor in weights_iterator:
+        if _KT_CPU_EXPERT_RE.match(name):
+            skipped += 1
+            skipped_bytes += tensor.numel() * tensor.element_size()
+            continue
+        yield name, tensor
+
+    if skipped:
+        logger.info(
+            "[KT] Filtered %d routed expert tensors (%.2f GB) from sglang loader; "
+            "they will be loaded by KTransformers CPUInfer.",
+            skipped,
+            skipped_bytes / (1024 ** 3),
+        )
 
 
 class LayeredModelLoader(DefaultModelLoader):

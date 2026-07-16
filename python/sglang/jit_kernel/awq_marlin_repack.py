@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -8,6 +9,18 @@ from sglang.jit_kernel.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+# Prefer the AOT sgl_kernel implementations when available to avoid the
+# multi-second TVM-FFI JIT compile on first use.
+_AOT_AWQ_MARLIN_REPACK = None
+_AOT_AWQ_MARLIN_MOE_REPACK = None
+if os.environ.get("SGLANG_FORCE_JIT_AWQ_MARLIN_REPACK", "0") != "1":
+    try:
+        from sgl_kernel import awq_marlin_repack as _AOT_AWQ_MARLIN_REPACK
+        from sgl_kernel import awq_marlin_moe_repack as _AOT_AWQ_MARLIN_MOE_REPACK
+    except Exception:
+        _AOT_AWQ_MARLIN_REPACK = None
+        _AOT_AWQ_MARLIN_MOE_REPACK = None
 
 
 @cache_once
@@ -25,6 +38,9 @@ def awq_marlin_repack(
     size_n: int,
     num_bits: int,
 ) -> torch.Tensor:
+    if _AOT_AWQ_MARLIN_REPACK is not None and b_q_weight.is_cuda:
+        return _AOT_AWQ_MARLIN_REPACK(b_q_weight, size_k, size_n, num_bits)
+
     tile_size = 16
     pack_factor = 32 // num_bits
     out = torch.empty(
@@ -44,6 +60,9 @@ def awq_marlin_moe_repack(
     size_n: int,
     num_bits: int,
 ) -> torch.Tensor:
+    if _AOT_AWQ_MARLIN_MOE_REPACK is not None and b_q_weight.is_cuda:
+        return _AOT_AWQ_MARLIN_MOE_REPACK(b_q_weight, perm, size_k, size_n, num_bits)
+
     num_experts = b_q_weight.shape[0]
     assert size_k % 16 == 0
     output = torch.empty(
