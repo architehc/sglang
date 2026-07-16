@@ -99,11 +99,17 @@ def _quantize_k_cache_ref(
         result_k_scale_factor[:, :, tile_idx] = cur_scale_factors_inv
 
         cur_scale_factors_inv.unsqueeze_(-1)  # [num_blocks, block_size, 1]
+        # guard the reciprocal like the kernel's `tl.where` (nvfp4_kv_cache.py:195):
+        # a zero-amax group emits 0 instead of NaN, non-degenerate outputs stay
+        # bit-identical
+        cur_scale_factors_inv = torch.where(
+            cur_scale_factors_inv > 0, 1.0 / cur_scale_factors_inv.float(), 0.0
+        )
         cur_quantized_nope = (
             input_k_cache[
                 ..., tile_idx * tile_size : (tile_idx + 1) * tile_size
             ].float()
-            / cur_scale_factors_inv.float()
+            * cur_scale_factors_inv
         ).to(fp8_dtype)
         result_k_nope_part[..., tile_idx * tile_size : (tile_idx + 1) * tile_size] = (
             cur_quantized_nope
@@ -300,9 +306,12 @@ def _quantize_k_cache_fast_kernel(
 
         y = tl.load(ptr, mask=mask, other=0.0).to(tl.float32)
 
-        # the ref impl do not have a `tl.maximum(... eps)`, so we remove it here
+        # the ref impl do not have a `tl.maximum(... eps)`, so we remove it here;
+        # instead guard the reciprocal with `tl.where` (same pattern as the NVFP4
+        # kernel at nvfp4_kv_cache.py:195): a zero-amax group emits 0 instead of
+        # NaN, and non-degenerate outputs stay bit-identical.
         y_s = tl.max(tl.abs(y)) / FP8_MAX
-        y_s_inv = 1.0 / y_s
+        y_s_inv = tl.where(y_s > 0, 1.0 / y_s, 0.0)
         y_q = tl.clamp(y * y_s_inv, FP8_MIN, FP8_MAX).to(
             output_nope_q_ptr.dtype.element_ty
         )
