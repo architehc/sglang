@@ -74,6 +74,10 @@ global_workspace_buffer = None
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
 _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
 
+# Control whether to fuse the topk transform into the topk kernel (default:
+# enabled). Launch-time toggle, frozen at import instead of read per forward.
+_NSA_FUSE_TOPK = envs.SGLANG_NSA_FUSE_TOPK.get()
+
 
 def _torch_fast_topk_v2(score, lengths, topk, row_starts=None, prewindowed=False):
     """Pure-torch replacement for sgl_kernel.fast_topk_v2.
@@ -135,28 +139,10 @@ def _torch_fast_topk_v2(score, lengths, topk, row_starts=None, prewindowed=False
 _fast_topk_v2_impl = None
 
 
-_topk_debug_count = 0
-
-
 def _fast_topk_v2_compat(score, lengths, topk, row_starts=None, prewindowed=False):
     """Use sgl_kernel fast_topk_v2 when it works on this GPU, else torch fallback."""
-    global _fast_topk_v2_impl, _topk_debug_count
-    import os as _os
+    global _fast_topk_v2_impl
 
-    if _os.environ.get("SGLANG_NSA_TOPK_DEBUG") == "1" and _topk_debug_count < 8:
-        if int(lengths.max().item()) > topk or (
-            row_starts is not None and int(row_starts.max().item()) > 0
-        ):
-            _topk_debug_count += 1
-            torch.save(
-                {
-                    "score": score.cpu(),
-                    "lengths": lengths.cpu(),
-                    "row_starts": None if row_starts is None else row_starts.cpu(),
-                    "topk": topk,
-                },
-                f"/tmp/claude-1000/-media-thread-game-ktransformers/bbfd774c-099c-45ba-b4de-a11c9487ffd1/scratchpad/nsa_topk_debug_{_topk_debug_count}.pt",
-            )
     if _fast_topk_v2_impl is None:
         import logging
 
@@ -366,7 +352,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         else:
             page_table_size_1 = self.attn_metadata.page_table_1
 
-        if not envs.SGLANG_NSA_FUSE_TOPK.get():
+        if not _NSA_FUSE_TOPK:
             return _fast_topk_v2_compat(
                 logits, seq_lens_topk, topk, row_starts=ks, prewindowed=prewindowed
             )
@@ -1536,7 +1522,7 @@ class NativeSparseAttnBackend(
 
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method()
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if _NSA_FUSE_TOPK:
             page_table_1 = topk_indices
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -1694,7 +1680,7 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if _NSA_FUSE_TOPK:
             page_table_1 = topk_indices
         else:
             src_page_table = metadata.page_table_1
@@ -2169,7 +2155,7 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if _NSA_FUSE_TOPK:
             page_table_1 = topk_indices
         else:
             src_page_table = metadata.page_table_1

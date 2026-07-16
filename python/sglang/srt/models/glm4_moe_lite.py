@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -320,6 +321,12 @@ class Glm4MoeLiteSparseMoeBlock(DeepseekV2MoE):
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        # Mirrors DeepseekV2MoE.__init__: this class overrides __init__ without
+        # calling super(), but inherits forward() which reads these attrs.
+        self._allow_shared_expert_dual_stream = (
+            envs.SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM.get()
+        )
+        self._kt_ep_dual_stream = envs.SGLANG_KT_EP_DUAL_STREAM.get()
 
 
 class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):

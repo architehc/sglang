@@ -211,6 +211,9 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# Launch-time debug toggle, frozen at import instead of read per decoder layer.
+_DEBUG_HIDDEN = os.environ.get("SGLANG_DEBUG_HIDDEN") == "1"
+
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
@@ -637,6 +640,13 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
+        # Launch-time dual-stream toggles, resolved once here instead of per
+        # forward() call (used by the dual-stream branch below in forward()).
+        self._allow_shared_expert_dual_stream = (
+            envs.SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM.get()
+        )
+        self._kt_ep_dual_stream = envs.SGLANG_KT_EP_DUAL_STREAM.get()
+
         if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
             assert hasattr(self, "shared_experts")
 
@@ -669,13 +679,13 @@ class DeepseekV2MoE(nn.Module):
 
         if not self._enable_a2a_moe:
             if (
-                envs.SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM.get()
+                self._allow_shared_expert_dual_stream
                 and self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
                 and (
-                    envs.SGLANG_KT_EP_DUAL_STREAM.get()
+                    self._kt_ep_dual_stream
                     or not is_wrapped_method(self.experts.quant_method, "kt_ep")
                 )
             ):
@@ -2801,12 +2811,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_format,
         )
 
-        import os as _dbg_os
-
-        _dbg = (
-            _dbg_os.environ.get("SGLANG_DEBUG_HIDDEN") == "1"
-            and hidden_states.shape[0] > 2000
-        )
+        _dbg = _DEBUG_HIDDEN and hidden_states.shape[0] > 2000
         if _dbg:
             _in_max = hidden_states.float().abs().max().item()
 

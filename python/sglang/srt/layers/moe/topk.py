@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import (
@@ -73,8 +74,12 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
-_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+# sm_120 row cap for the fused sigmoid topk kernel (see fused_topk below).
+# Launch-time toggle, frozen at import: SGLANG_SIGMOID_FUSED_MAXROWS=0
+# disables the fused path entirely.
+_SIGMOID_FUSED_MAXROWS = int(os.environ.get("SGLANG_SIGMOID_FUSED_MAXROWS", "1408"))
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -478,13 +483,9 @@ def fused_topk(
         # captured production tensors (logs/topk_nan_repro.pt). Rows within
         # that bound ARE written correctly, so keep the fused kernel for small
         # batches (decode) and use eps-safe torch routing above the bound.
-        # SGLANG_SIGMOID_FUSED_MAXROWS=0 disables the fused path entirely.
-        import os as _os
-
-        _fused_maxrows = int(
-            _os.environ.get("SGLANG_SIGMOID_FUSED_MAXROWS", "1408")
-        )
-        if 0 < M <= _fused_maxrows:
+        # SGLANG_SIGMOID_FUSED_MAXROWS=0 disables the fused path entirely
+        # (read once at import into _SIGMOID_FUSED_MAXROWS).
+        if 0 < M <= _SIGMOID_FUSED_MAXROWS:
             topk_sigmoid(
                 topk_weights,
                 topk_ids,

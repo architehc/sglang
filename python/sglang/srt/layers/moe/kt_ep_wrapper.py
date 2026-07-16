@@ -6,7 +6,9 @@ This module provides a generic wrapper that enables CPU-GPU expert parallelism
 for any MoE quantization method. It coordinates parallel execution of GPU experts
 (using any quantization method) and CPU experts (using AMX/AVX instructions).
 
-Diagnostic / escape-hatch environment variables (KT-DEBUG-ONLY; not for prod):
+Diagnostic / escape-hatch environment variables (KT-DEBUG-ONLY; not for prod).
+All of these are launch-time toggles, read once at module import (see the
+_KT_* constants below) rather than per apply() call.
 
     SGLANG_KT_HYBRID_TIMING=1
         Per-call wall-time breakdown of submit / mask / gpu / sync / merge
@@ -48,6 +50,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.utils import get_compiler_backend, is_cuda
@@ -72,6 +75,15 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+# Launch-time env toggles frozen at import (see module docstring): reading
+# os.environ per layer in the hot apply() path costs ~0.2-0.4 ms per eager
+# decode step across the 61 MoE layers of GLM-5.2.
+_KT_DEBUG_HIDDEN = os.environ.get("SGLANG_DEBUG_HIDDEN") == "1"
+_KT_HYBRID_TIMING = os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
+_KT_HYBRID_NO_CPU_STREAM = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
+_KT_BYPASS_GPU_MOE = os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1"
+_KT_DSV4_2604_SUBMODE = envs.SGLANG_DSV4_2604_SUBMODE.get()
 
 # Global cache for GPU experts masks (initialized once per session)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
@@ -2485,6 +2497,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Warn-once flag: the SharedFullContext fallback needs the KT CPU
         # wrapper to export GPU-format weights; LLAMAFILE (GGUF) cannot.
         self._warned_layerwise_unsupported = False
+        # Log-once flag for the [kt-ep-diag] DEBUG line in apply().
+        self._diag_logged = False
         self._full_init_args = None
         self.wrapper: Optional[KTMoEWrapper] = None
 
@@ -2938,7 +2952,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         if (
-            os.environ.get("SGLANG_DEBUG_HIDDEN") == "1"
+            _KT_DEBUG_HIDDEN
             and x.shape[0] > 2000
             and self.kt_config.layer_idx in (63, 64, 65)
         ):
@@ -2958,7 +2972,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
         _kt_timing = (
-            os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
+            _KT_HYBRID_TIMING
             and self.tp_rank == 0
             and getattr(self.kt_config, "layer_idx", None) in (0, 5, 20, 35)
         )
@@ -3110,7 +3124,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             staging_buffer.copy_(x, non_blocking=True)
 
             # SGLANG_KT_HYBRID_NO_CPU_STREAM=1 collapses cpu_stream onto main stream.
-            _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
+            _no_cpu_stream = _KT_HYBRID_NO_CPU_STREAM
             if not _no_cpu_stream:
                 # Fork to cpu_stream (waits for staging copy to complete)
                 self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
@@ -3153,7 +3167,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Skip the GPU GEMM entirely and start from zeros; the CPU path then
         # provides 100% of the routed-expert contribution.
         # Origin: kt-sglang 耦合 (sglang/kt_ep_wrapper.py).
-        if not getattr(self, "_diag_logged", False) and logger.isEnabledFor(logging.DEBUG):
+        if not self._diag_logged and logger.isEnabledFor(logging.DEBUG):
             self._diag_logged = True
             try:
                 _mask_sum = int(self.gpu_experts_mask.sum().item())
@@ -3174,7 +3188,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Flash + --kt-num-gpu-experts=0), which defeats the
         # num_gpu_experts==0 short-circuit. The env var lets the operator
         # force the bypass without untangling the mask generator.
-        if self.num_gpu_experts == 0 or os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1":
+        if self.num_gpu_experts == 0 or _KT_BYPASS_GPU_MOE:
             gpu_combine_input = None
             output = torch.zeros_like(x)
             # 2604B sub-mode adds a runtime path-checker assertion in the
@@ -3182,8 +3196,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # MoE forward). The trtllm path bumps it inside its body; the
             # bypass path mirrors that here so the assertion still passes
             # when GPU MoE is short-circuited in favour of CPU experts.
-            from sglang.srt.environ import envs as _envs
-            if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+            if _KT_DSV4_2604_SUBMODE == "2604B":
                 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
                     deepseek_v4_moe_code_path_checker,
                 )
@@ -3198,7 +3211,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Step 4: Sync CPU results on cpu_stream, then synchronize streams
         if self.tp_rank == 0 and self._cpu_stream is not None:
-            _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
+            _no_cpu_stream = _KT_HYBRID_NO_CPU_STREAM
             from contextlib import nullcontext as _ctx_null
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
             with _stream_ctx:
