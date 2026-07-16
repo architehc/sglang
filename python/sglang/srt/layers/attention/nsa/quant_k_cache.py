@@ -100,8 +100,8 @@ def _quantize_k_cache_ref(
 
         cur_scale_factors_inv.unsqueeze_(-1)  # [num_blocks, block_size, 1]
         # guard the reciprocal like the kernel's `tl.where` (nvfp4_kv_cache.py:195):
-        # a zero-amax group emits 0 instead of NaN, non-degenerate outputs stay
-        # bit-identical
+        # a zero-amax group emits 0 instead of NaN; non-degenerate outputs match the
+        # kernel through the reciprocal rounding path (within 1 fp8 ulp of the old ref)
         cur_scale_factors_inv = torch.where(
             cur_scale_factors_inv > 0, 1.0 / cur_scale_factors_inv.float(), 0.0
         )
