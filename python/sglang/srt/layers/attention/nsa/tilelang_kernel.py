@@ -1747,11 +1747,28 @@ def sparse_mla_fwd_decode_combine(
     return main
 
 
+# Geometries that compile and validate on sm_120
+# (bench: blackwell/scripts/kernel_geom_bench.py). h32/h32p stay in the file
+# for reference but fail TVM layout inference ("Layout infer conflict between
+# m_i and alpha": with H=32/BI=32 the row-reduce fragment layout of acc_s
+# [32,32] cannot be reconciled with the T.Parallel(H) loop layout at
+# threads=256); selecting them must fail fast here, not deep in the JIT at
+# the first attention call.
+_NSA_TILELANG_GEOM_WORKING = ("h16", "h32ds")
+_NSA_TILELANG_GEOM_BROKEN = ("h32", "h32p")
+
+
 @functools.cache
 def _nsa_tilelang_geom() -> str:
-    """sm_120 smem-geometry selector: SGLANG_NSA_TILELANG_GEOM = h16|h32|h32ds|h32p."""
+    """sm_120 smem-geometry selector: SGLANG_NSA_TILELANG_GEOM = h16|h32ds."""
     geom = os.environ.get("SGLANG_NSA_TILELANG_GEOM", "h16").strip().lower()
-    if geom not in ("h16", "h32", "h32ds", "h32p"):
+    if geom in _NSA_TILELANG_GEOM_BROKEN:
+        raise ValueError(
+            f"SGLANG_NSA_TILELANG_GEOM={geom!r} is known-broken on sm_120 "
+            "(tvm.error.InternalError: Layout infer conflict between m_i and "
+            f"alpha); supported values: {_NSA_TILELANG_GEOM_WORKING}."
+        )
+    if geom not in _NSA_TILELANG_GEOM_WORKING:
         logger.warning(
             "Unknown SGLANG_NSA_TILELANG_GEOM=%r, falling back to h16", geom
         )
