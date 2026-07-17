@@ -608,13 +608,23 @@ def sparse_attention_fwd_kernel_v1_h32(
                 for bi_i in T.Parallel(BI):
                     mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
 
+                # Clamp the gather index: production index pages are padded
+                # with -1, which would otherwise read out of bounds. The
+                # masked row below contributes exp2(-inf) = 0 either way, so
+                # clamping to row 0 is numerically inert.
                 for bi_i, d_i in T.Parallel(BI, D):
                     KV_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
+                        g_i,
+                        d_i,
                     ]
                 for bi_i, d_i in T.Parallel(BI, D_tail):
                     K_tail_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
+                        g_i,
+                        D + d_i,
                     ]
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
@@ -1069,13 +1079,23 @@ def sparse_attention_fwd_kernel_v1_h32p(
                     mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
 
                 # Pure gathers -> planner copy stage (prefetched + versioned).
+                # Clamp the gather index: production index pages are padded
+                # with -1, which would otherwise read out of bounds. The
+                # masked row below contributes exp2(-inf) = 0 either way, so
+                # clamping to row 0 is numerically inert.
                 for bi_i, d_i in T.Parallel(BI, DH):
                     KV_l_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
+                        g_i,
+                        d_i,
                     ]
                 for bi_i, d_i in T.Parallel(BI, D_tail):
                     K_tail_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
+                        g_i,
+                        D + d_i,
                     ]
                 # Predicated gather -> NOT a pure copy (if_then_else value),
                 # so it stays in the consumer stage, single-buffered. Do not
