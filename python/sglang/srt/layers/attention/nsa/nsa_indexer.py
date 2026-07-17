@@ -82,6 +82,7 @@ def _use_torch_mqa_logits() -> bool:
 
 
 _SM120_MQA_IMPL = None
+_SM120_PAGED_MQA_IMPL = None
 
 
 def _dispatch_fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=True):
@@ -123,23 +124,38 @@ def _dispatch_fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=True):
 def _dispatch_fp8_paged_mqa_logits(
     q, kv_cache, weights, seqlens, block_tables, schedule_metadata, max_seq_len, clean_logits=True
 ):
+    global _SM120_PAGED_MQA_IMPL
     if _use_torch_mqa_logits():
-        try:
-            from sglang.srt.layers.attention.nsa.sm120_mqa_logits_triton import (
-                triton_fp8_paged_mqa_logits,
-            )
+        if _SM120_PAGED_MQA_IMPL is None:
+            try:
+                from sglang.srt.layers.attention.nsa.sm120_mqa_logits_triton import (
+                    triton_fp8_paged_mqa_logits,
+                )
 
-            return triton_fp8_paged_mqa_logits(
-                q, kv_cache, weights, seqlens, block_tables, schedule_metadata, max_seq_len
-            )
-        except Exception:
-            from sglang.srt.layers.attention.nsa.sm120_mqa_logits import (
-                torch_fp8_paged_mqa_logits,
-            )
+                out = triton_fp8_paged_mqa_logits(
+                    q, kv_cache, weights, seqlens, block_tables, schedule_metadata, max_seq_len
+                )
+                _SM120_PAGED_MQA_IMPL = triton_fp8_paged_mqa_logits
+                import logging
 
-            return torch_fp8_paged_mqa_logits(
-                q, kv_cache, weights, seqlens, block_tables, schedule_metadata, max_seq_len
-            )
+                logging.getLogger(__name__).info("sm120 paged MQA logits backend: triton")
+                return out
+            except Exception as e:  # first-call probe only; later calls propagate
+                from sglang.srt.layers.attention.nsa.sm120_mqa_logits import (
+                    torch_fp8_paged_mqa_logits,
+                )
+
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "sm120 paged MQA logits: triton kernel unavailable (%s); "
+                    "using torch fallback.",
+                    e,
+                )
+                _SM120_PAGED_MQA_IMPL = torch_fp8_paged_mqa_logits
+        return _SM120_PAGED_MQA_IMPL(
+            q, kv_cache, weights, seqlens, block_tables, schedule_metadata, max_seq_len
+        )
     return deep_gemm.fp8_paged_mqa_logits(
         q, kv_cache, weights, seqlens, block_tables, schedule_metadata, max_seq_len, clean_logits=clean_logits
     )

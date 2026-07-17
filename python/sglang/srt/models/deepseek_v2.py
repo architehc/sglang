@@ -214,6 +214,10 @@ logger = logging.getLogger(__name__)
 # Launch-time debug toggle, frozen at import instead of read per decoder layer.
 _DEBUG_HIDDEN = os.environ.get("SGLANG_DEBUG_HIDDEN") == "1"
 
+# Launch-time rope-fusion toggle, frozen at import instead of read per
+# attention prepare call.
+_FUSED_MLA_ENABLE_ROPE_FUSION = os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
+
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
@@ -2357,9 +2361,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        enable_rope_fusion = (
-            os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
-        )
+        enable_rope_fusion = _FUSED_MLA_ENABLE_ROPE_FUSION
         # NOTE: hidden_states can be a tuple for some quantization paths.
         # For shape/device/dtype, use the first tensor; still pass the original
         # hidden_states through linear ops which may accept tuple inputs.
@@ -3189,16 +3191,6 @@ class DeepseekV2Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                import os as _dsp_os
-                if (
-                    _dsp_os.environ.get("SGLANG_DSPARK_CAPTURE") == "1"
-                    and i in (8, 23, 39, 55, 70)
-                ):
-                    if not hasattr(self, "_dspark_cap"):
-                        self._dspark_cap = []
-                    if i == 8:
-                        self._dspark_cap = []
-                    self._dspark_cap.append((hidden_states + residual).detach().to(torch.bfloat16))
                 if i in self.layers_to_capture:
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
                         aux_hidden_state = tensor_model_parallel_all_gather(
@@ -3254,22 +3246,6 @@ class DeepseekV2Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-        import os as _dsp_os
-        if _dsp_os.environ.get("SGLANG_DSPARK_CAPTURE") == "1" and getattr(self, "_dspark_cap", None):
-            aux_hidden_states_dump = self._dspark_cap
-            self._dspark_cap = []
-            _dir = "/media/thread/game/dspark_port/captures"
-            _dsp_os.makedirs(_dir, exist_ok=True)
-            _n = len(_dsp_os.listdir(_dir))
-            if _n < 400:
-                torch.save(
-                    {
-                        "aux": torch.cat([a for a in aux_hidden_states_dump], dim=-1).cpu(),
-                        "input_ids": input_ids.detach().cpu(),
-                        "positions": positions.detach().cpu(),
-                    },
-                    f"{_dir}/cap_{_n:05d}.pt",
-                )
 
         if len(aux_hidden_states) == 0:
             return hidden_states

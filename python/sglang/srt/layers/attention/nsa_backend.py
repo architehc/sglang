@@ -364,12 +364,15 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             cu_topk_indices_offset = topk_indices_offset_override
             cu_seqlens_q_topk = None
         elif cu_seqlens_q is not None:
-            cu_seqlens_q = cu_seqlens_q.to(torch.int32)
-            cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
-            cu_topk_indices_offset = torch.repeat_interleave(
-                cu_seqlens_q_topk[:-1],
-                cu_seqlens_q,
-            )
+            if _NSA_FUSE_TOPK:
+                # Only the fused path consumes these; computing them under
+                # FUSE_TOPK=0 is a dead D2H sync per call.
+                cu_seqlens_q = cu_seqlens_q.to(torch.int32)
+                cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
+                cu_topk_indices_offset = torch.repeat_interleave(
+                    cu_seqlens_q_topk[:-1],
+                    cu_seqlens_q,
+                )
         else:
             cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
             cu_topk_indices_offset = self.attn_metadata.topk_indices_offset

@@ -814,10 +814,17 @@ def sparse_attention_fwd_kernel_v1_h32ds(
                         mask[bi_i], 0, -T.infinity(acc_s.dtype)
                     )
 
+                # Clamp the gather index: production index pages are padded
+                # with -1, which would otherwise read out of bounds. The
+                # masked row below contributes exp2(-inf) = 0 either way, so
+                # clamping to row 0 is numerically inert.
                 # K pass, half 0: columns [0, DH)
                 for bi_i, d_i in T.Parallel(BI, DH):
                     KV_half_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
+                        g_i,
+                        d_i,
                     ]
                 T.gemm(
                     Q_shared_l,
@@ -829,7 +836,10 @@ def sparse_attention_fwd_kernel_v1_h32ds(
                 # K pass, half 1: columns [DH, D)
                 for bi_i, d_i in T.Parallel(BI, DH):
                     KV_half_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, DH + d_i
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
+                        g_i,
+                        DH + d_i,
                     ]
                 T.gemm(
                     Q_shared_r,
@@ -841,7 +851,10 @@ def sparse_attention_fwd_kernel_v1_h32ds(
                 # tail
                 for bi_i, d_i in T.Parallel(BI, D_tail):
                     K_tail_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
+                        g_i,
+                        D + d_i,
                     ]
                 T.gemm(
                     Q_tail_shared,
@@ -872,7 +885,10 @@ def sparse_attention_fwd_kernel_v1_h32ds(
                 # V pass, half 0: reload columns [0, DH)
                 for bi_i, d_i in T.Parallel(BI, DH):
                     KV_half_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
+                        g_i,
+                        d_i,
                     ]
                 T.gemm(
                     S_shared,
@@ -883,7 +899,10 @@ def sparse_attention_fwd_kernel_v1_h32ds(
                 # V pass, half 1: reload columns [DH, D)
                 for bi_i, d_i in T.Parallel(BI, DH):
                     KV_half_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, DH + d_i
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
+                        g_i,
+                        DH + d_i,
                     ]
                 T.gemm(
                     S_shared,
@@ -1870,6 +1889,10 @@ def tilelang_sparse_fwd(
         # v2's tiles need ~226KB dynamic smem (Hopper/SM100). sm_120 workstation
         # Blackwell caps at ~99KB per block; v1 with num_stages=1 fits.
         kv_dtype = "float8_e4m3" if kv.dtype == torch.float8_e4m3fn else "bfloat16"
+        assert kv_dtype == "bfloat16", (
+            "fp8 pool read without per-128-block scale folding is numerically wrong; "
+            "dequantize first or implement scale folding (campaign-2 Task 12)"
+        )
         # Optional sm_120 smem-geometry override (see table above the h32
         # kernels): h16 (default, current path) | h32 | h32ds | h32p.
         geom = _nsa_tilelang_geom() if _small_smem else "h16"
