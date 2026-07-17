@@ -407,12 +407,15 @@ def sparse_attention_fwd_kernel_v1(
 #  h16  H16 BI64 full-D (cur)   16,384  2,048 65,536   8,192 2,048  94,208  yes (7,168 free)
 #  h16  BI64 num_stages=2       16,384  2,048 131,072 16,384 2,048 167,936  NO
 #  h32  H32 BI64 full-D naive   32,768  4,096 65,536   8,192 4,096 114,688  NO (over by 13,312)
-#  h32  H32 BI32 full-D (impl)  32,768  4,096 32,768   4,096 2,048  75,776  yes (25,600 free)
+#  h32  H32 BI32 full-D (impl)  32,768  4,096 32,768   4,096 2,048  76,416+ yes (24,960 free)
 #  h32ds H32 BI64 D-split 2x256 32,768* 4,096 32,768** 8,192 4,096  81,920  yes (19,456 free)
 #  h32ds + double-buffered half 32,768  4,096 65,536   8,192 4,096 114,688  NO
 #  h32p H32 BI32 2-stage full-D 32,768  4,096 65,536  8,192  2,048 112,640  NO (over by 11,264)
-#  h32p H32 BI32 prefetch(impl) 32,768* 4,096 49,152*** 8,192**** 2,048 96,256 yes (5,120 free)
+#  h32p H32 BI32 prefetch(impl) 32,768* 4,096 49,152*** 8,192**** 2,048 96,896+ yes (4,480 free)
 #  h64  H64 BI64 full-D         65,536  8,192 65,536   8,192 8,192 155,648  NO
+#   +  includes 640 B of per-head softmax-state smem (m/sumexp/alpha, see
+#      h32/h32p alloc comment; kept off registers to dodge the acc_s [32,32]
+#      reduce-layout vs T.Parallel(H) loop-layout conflict)
 #   *  as two [H,256] halves (needed as separate tiles for the half gemms)
 #   ** one [64,256] half-buffer reused 4x/iter: K half0, K half1, V half0, V half1
 #   *** KV_l [32,256] pipelined 2 versions (32,768) + KV_r [32,256] single
@@ -490,7 +493,8 @@ def sparse_attention_fwd_kernel_v1_h32(
     """H32 full-D variant of v1 for sm_120 (see geometry table above).
 
     H_per_block=32, block_I=32 so the full 576-dim KV tile fits in 99KB smem
-    single-buffered. Structure is byte-for-byte v1 apart from the geometry.
+    single-buffered. Structure is v1 apart from the geometry and the
+    shared-memory softmax state (see alloc comment below).
     """
     assert dim == tilelang.math.next_power_of_2(
         dim
@@ -559,15 +563,26 @@ def sparse_attention_fwd_kernel_v1_h32(
             acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
             S_shared = T.alloc_shared([H_per_block, BI], dtype)
-            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+            # Per-head softmax state lives in shared memory, not fragments:
+            # with H=32/BI=32 at threads=256 the acc_s [32,32] row-reduce
+            # output layout (replicate 16) cannot be reconciled with the
+            # T.Parallel(H) loop layout (replicate 32) -- tilelang 0.1.12
+            # LayoutInference raises "Layout infer conflict between m_i and
+            # alpha". Shared buffers have no thread layout; the reduce-output
+            # fragments are only written by T.reduce_* and read by T.copy
+            # into shared, both layout-agnostic. Cost: 5 x 32 x 4B = 640 B.
+            m_tile = T.alloc_fragment([H_per_block], accum_dtype)
             sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
-            alpha = T.alloc_fragment([H_per_block], accum_dtype)
-            m_i = T.alloc_fragment([H_per_block], accum_dtype)
-            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+            m_shared = T.alloc_shared([H_per_block], accum_dtype)
+            m_tile_shared = T.alloc_shared([H_per_block], accum_dtype)
+            sumexp_shared = T.alloc_shared([H_per_block], accum_dtype)
+            sumexp_i_shared = T.alloc_shared([H_per_block], accum_dtype)
+            alpha_shared = T.alloc_shared([H_per_block], accum_dtype)
 
             T.fill(acc_o, 0)
-            T.fill(sumexp, 0)
-            T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
+            for h_i in T.Parallel(H_per_block):
+                sumexp_shared[h_i] = 0
+                m_shared[h_i] = -(2**30)  # avoid -inf - inf to cause nan
 
             b_i, g_i = by, bz
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
@@ -612,28 +627,37 @@ def sparse_attention_fwd_kernel_v1_h32(
                     transpose_B=True,
                     policy=T.GemmWarpPolicy.FullCol,
                 )
-                T.copy(m_i, m_i_prev)
-                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                T.reduce_max(acc_s, m_tile, dim=1, clear=True)
+                T.copy(m_tile, m_tile_shared)
                 for h_i in T.Parallel(H_per_block):
-                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                    alpha_shared[h_i] = T.exp2(
+                        (m_shared[h_i] - T.max(m_shared[h_i], m_tile_shared[h_i]))
+                        * sm_scale
+                    )
+                    m_shared[h_i] = T.max(m_shared[h_i], m_tile_shared[h_i])
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.exp2(
-                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                        acc_s[h_i, bi_i] * sm_scale - m_shared[h_i] * sm_scale
                     )
-                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                T.reduce_sum(acc_s, sumexp_i, dim=1, clear=True)
+                T.copy(sumexp_i, sumexp_i_shared)
                 for h_i in T.Parallel(H_per_block):
-                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                    sumexp_shared[h_i] = (
+                        sumexp_shared[h_i] * alpha_shared[h_i] + sumexp_i_shared[h_i]
+                    )
                 for h_i, d_i in T.Parallel(H_per_block, D):
-                    acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
+                    acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha_shared[h_i]
 
                 T.copy(acc_s, S_shared)
                 T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
 
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] /= sumexp[h_i]
+                acc_o[h_i, d_i] /= sumexp_shared[h_i]
             for h_i in T.Parallel(H_per_block):
-                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+                sumexp_shared[h_i] = (
+                    T.log2(sumexp_shared[h_i]) + m_shared[h_i] * sm_scale
+                )
 
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
 
@@ -999,16 +1023,27 @@ def sparse_attention_fwd_kernel_v1_h32p(
             acc_o_r = T.alloc_fragment([H_per_block, DH], accum_dtype)
             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
             S_shared = T.alloc_shared([H_per_block, BI], dtype)
-            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+            # Per-head softmax state lives in shared memory, not fragments:
+            # with H=32/BI=32 at threads=256 the acc_s [32,32] row-reduce
+            # output layout (replicate 16) cannot be reconciled with the
+            # T.Parallel(H) loop layout (replicate 32) -- tilelang 0.1.12
+            # LayoutInference raises "Layout infer conflict between m_i and
+            # alpha". Shared buffers have no thread layout; the reduce-output
+            # fragments are only written by T.reduce_* and read by T.copy
+            # into shared, both layout-agnostic. Cost: 5 x 32 x 4B = 640 B.
+            m_tile = T.alloc_fragment([H_per_block], accum_dtype)
             sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
-            alpha = T.alloc_fragment([H_per_block], accum_dtype)
-            m_i = T.alloc_fragment([H_per_block], accum_dtype)
-            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+            m_shared = T.alloc_shared([H_per_block], accum_dtype)
+            m_tile_shared = T.alloc_shared([H_per_block], accum_dtype)
+            sumexp_shared = T.alloc_shared([H_per_block], accum_dtype)
+            sumexp_i_shared = T.alloc_shared([H_per_block], accum_dtype)
+            alpha_shared = T.alloc_shared([H_per_block], accum_dtype)
 
             T.fill(acc_o_l, 0)
             T.fill(acc_o_r, 0)
-            T.fill(sumexp, 0)
-            T.fill(m_i, -(2**30))  # avoid -inf - inf to cause nan
+            for h_i in T.Parallel(H_per_block):
+                sumexp_shared[h_i] = 0
+                m_shared[h_i] = -(2**30)  # avoid -inf - inf to cause nan
 
             b_i, g_i = by, bz
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
@@ -1073,21 +1108,28 @@ def sparse_attention_fwd_kernel_v1_h32p(
                     transpose_B=True,
                     policy=T.GemmWarpPolicy.FullCol,
                 )
-                T.copy(m_i, m_i_prev)
-                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                T.reduce_max(acc_s, m_tile, dim=1, clear=True)
+                T.copy(m_tile, m_tile_shared)
                 for h_i in T.Parallel(H_per_block):
-                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                    alpha_shared[h_i] = T.exp2(
+                        (m_shared[h_i] - T.max(m_shared[h_i], m_tile_shared[h_i]))
+                        * sm_scale
+                    )
+                    m_shared[h_i] = T.max(m_shared[h_i], m_tile_shared[h_i])
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.exp2(
-                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                        acc_s[h_i, bi_i] * sm_scale - m_shared[h_i] * sm_scale
                     )
-                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                T.reduce_sum(acc_s, sumexp_i, dim=1, clear=True)
+                T.copy(sumexp_i, sumexp_i_shared)
                 for h_i in T.Parallel(H_per_block):
-                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                    sumexp_shared[h_i] = (
+                        sumexp_shared[h_i] * alpha_shared[h_i] + sumexp_i_shared[h_i]
+                    )
                 for h_i, d_i in T.Parallel(H_per_block, DH):
-                    acc_o_l[h_i, d_i] = acc_o_l[h_i, d_i] * alpha[h_i]
+                    acc_o_l[h_i, d_i] = acc_o_l[h_i, d_i] * alpha_shared[h_i]
                 for h_i, d_i in T.Parallel(H_per_block, DH):
-                    acc_o_r[h_i, d_i] = acc_o_r[h_i, d_i] * alpha[h_i]
+                    acc_o_r[h_i, d_i] = acc_o_r[h_i, d_i] * alpha_shared[h_i]
 
                 T.copy(acc_s, S_shared)
                 T.gemm(
@@ -1105,11 +1147,13 @@ def sparse_attention_fwd_kernel_v1_h32p(
 
             # Rescale
             for h_i, d_i in T.Parallel(H_per_block, DH):
-                acc_o_l[h_i, d_i] /= sumexp[h_i]
+                acc_o_l[h_i, d_i] /= sumexp_shared[h_i]
             for h_i, d_i in T.Parallel(H_per_block, DH):
-                acc_o_r[h_i, d_i] /= sumexp[h_i]
+                acc_o_r[h_i, d_i] /= sumexp_shared[h_i]
             for h_i in T.Parallel(H_per_block):
-                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+                sumexp_shared[h_i] = (
+                    T.log2(sumexp_shared[h_i]) + m_shared[h_i] * sm_scale
+                )
 
             T.copy(acc_o_l, Output[b_i, s_i, H0:H1, 0:DH])
             T.copy(acc_o_r, Output[b_i, s_i, H0:H1, DH:D])
@@ -1748,19 +1792,19 @@ def sparse_mla_fwd_decode_combine(
 
 
 # Geometries that compile and validate on sm_120
-# (bench: blackwell/scripts/kernel_geom_bench.py). h32/h32p stay in the file
-# for reference but fail TVM layout inference ("Layout infer conflict between
-# m_i and alpha": with H=32/BI=32 the row-reduce fragment layout of acc_s
-# [32,32] cannot be reconciled with the T.Parallel(H) loop layout at
-# threads=256); selecting them must fail fast here, not deep in the JIT at
+# (bench: blackwell/scripts/kernel_geom_bench.py). h32/h32p originally failed
+# TVM layout inference ("Layout infer conflict between m_i and alpha") until
+# their per-head softmax state moved to shared memory (see h32 alloc
+# comment). If a future variant breaks JIT, list it in
+# _NSA_TILELANG_GEOM_BROKEN so it fails fast here instead of deep in TVM at
 # the first attention call.
-_NSA_TILELANG_GEOM_WORKING = ("h16", "h32ds")
-_NSA_TILELANG_GEOM_BROKEN = ("h32", "h32p")
+_NSA_TILELANG_GEOM_WORKING = ("h16", "h32", "h32ds", "h32p")
+_NSA_TILELANG_GEOM_BROKEN = ()
 
 
 @functools.cache
 def _nsa_tilelang_geom() -> str:
-    """sm_120 smem-geometry selector: SGLANG_NSA_TILELANG_GEOM = h16|h32ds."""
+    """sm_120 smem-geometry selector: SGLANG_NSA_TILELANG_GEOM = h16|h32|h32ds|h32p."""
     geom = os.environ.get("SGLANG_NSA_TILELANG_GEOM", "h16").strip().lower()
     if geom in _NSA_TILELANG_GEOM_BROKEN:
         raise ValueError(
