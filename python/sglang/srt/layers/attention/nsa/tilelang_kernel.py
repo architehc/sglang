@@ -302,7 +302,6 @@ def sparse_attention_fwd_kernel_v1(
             Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
             KV_shared = T.alloc_shared([BI, D], dtype)
             K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-            O_shared = T.alloc_shared([H_per_block, D], dtype)
             mask = T.alloc_fragment([BI], "bool")
 
             acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
@@ -334,13 +333,23 @@ def sparse_attention_fwd_kernel_v1(
                 for bi_i in T.Parallel(BI):
                     mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
 
+                # Clamp the gather index: production index pages are padded
+                # with -1, which would otherwise read out of bounds. The
+                # masked row below contributes exp2(-inf) = 0 either way, so
+                # clamping to row 0 is numerically inert.
                 for bi_i, d_i in T.Parallel(BI, D):
                     KV_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
+                        g_i,
+                        d_i,
                     ]
                 for bi_i, d_i in T.Parallel(BI, D_tail):
                     K_tail_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
+                        g_i,
+                        D + d_i,
                     ]
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
@@ -384,7 +393,6 @@ def sparse_attention_fwd_kernel_v1(
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
 
-            T.copy(acc_o, O_shared)
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
 
     return main
@@ -399,8 +407,8 @@ def sparse_attention_fwd_kernel_v1(
 # All gemm operand tiles are bf16 even on the fp8-KV path: the indexed gather
 # copy casts fp8 -> bf16 elementwise into KV_shared/K_tail_shared. Accumulators
 # (acc_o, acc_s) and softmax stats (m_i, sumexp, alpha, ...) are register
-# fragments, not smem. O_shared in v1 is dead (acc_o is copied straight to
-# global) and is eliminated by the compiler, so it is excluded below.
+# fragments, not smem (except in h32/h32p, see the + footnote below). v1's
+# dead O_shared (acc_o goes straight to global) has been removed.
 # sm_120 opt-in cap: 99 KB / block = 101,376 B. Hopper (v2 path): 228 KB.
 #
 #  Geometry                     Q      Q_tail KV      K_tail S     total    fits?
