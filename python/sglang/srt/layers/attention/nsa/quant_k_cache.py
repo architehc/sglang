@@ -355,7 +355,7 @@ if __name__ == "__main__":
         ref_quant = _quantize_k_cache_ref(input_k_cache)
         actual_quant = _quantize_k_cache_fast_wrapped(input_k_cache)
 
-        ref_ref_dequant = dequant_k_cache._dequantize_k_cache_slow(ref_quant)
+        ref_ref_dequant = dequant_k_cache._dequantize_k_cache_ref(ref_quant)
         ref_actual_dequant = dequant_k_cache._dequantize_k_cache_fast_wrapped(ref_quant)
         actual_actual_dequant = dequant_k_cache._dequantize_k_cache_fast_wrapped(
             actual_quant
