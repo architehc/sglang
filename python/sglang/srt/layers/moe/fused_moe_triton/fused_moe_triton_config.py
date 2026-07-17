@@ -153,6 +153,16 @@ def get_default_config(
         "num_warps": 4,
         "num_stages": 2
     }
+    # A heuristic: fused marlin works faster with this config for small M.
+    # Restored ahead of the hardcoded 5090-workaround return below, which
+    # stays in effect for everything else (non-marlin or larger M).
+    if is_marlin and M <= 32:
+        return {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+        }
     return base_config_item
     if get_global_server_args().enable_deterministic_inference:
         config = {
