@@ -161,6 +161,15 @@ def _paged_mqa_logits_kernel(
 
     offs_k = pid_k * BK + tl.arange(0, BK)
     km = offs_k < max_seq_len
+    seq = tl.load(seqlens_ptr + pid_r)
+    # Blocks fully past the row's true seqlen only ever write -inf (see the
+    # tl.where below); store it directly and skip the block-table gather and
+    # dot. The grid is static (sized on max_seq_len), so CUDA-graph capture
+    # is unaffected.
+    if pid_k * BK >= seq:
+        tl.store(out_ptr + pid_r * max_seq_len + offs_k, float("-inf"), mask=km)
+        return
+
     page_slot = offs_k // PAGE
     in_page = offs_k % PAGE
     phys = tl.load(bt_ptr + b * max_pages + page_slot, mask=km, other=0)
@@ -192,7 +201,6 @@ def _paged_mqa_logits_kernel(
     )
     acc *= ksc
 
-    seq = tl.load(seqlens_ptr + pid_r)
     acc = tl.where(offs_k < seq, acc, float("-inf"))
     tl.store(out_ptr + pid_r * max_seq_len + offs_k, acc, mask=km)
 
