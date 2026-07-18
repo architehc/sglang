@@ -195,7 +195,11 @@ def _fast_topk_v2_compat(score, lengths, topk, row_starts=None, prewindowed=Fals
     """Use sgl_kernel fast_topk_v2 when it works on this GPU, else torch fallback."""
     global _fast_topk_v2_impl
 
-    if _NSA_TRITON_TOPK:
+    # Decode/verify shapes only: the Triton kernel is tuned for the
+    # single-row decode case; at prefill row counts (up to 32k) it runs
+    # pathologically. Mirror the split-topk discriminator in
+    # _forward_tilelang (q_all.shape[0] <= 64); score is [q_rows, L].
+    if _NSA_TRITON_TOPK and score.shape[0] <= 64:
         from sglang.srt.layers.attention.nsa.triton_topk import (
             triton_topk_supports,
             triton_topk_v2,
@@ -392,7 +396,6 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         from sgl_kernel import (
             fast_topk_transform_fused,
             fast_topk_transform_ragged_fused,
-            fast_topk_v2,
         )
 
         if topk_indices_offset_override is not None:
