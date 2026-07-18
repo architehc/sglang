@@ -404,6 +404,12 @@ class Envs:
     # traffic would scale with token count. Default OFF pending the decode
     # A/B ladder (campaign-2 task 9).
     SGLANG_NSA_SPLIT_TOPK = EnvBool(False)
+    # Replace the torch.topk fallback in _fast_topk_v2_compat with the exact
+    # seqlen-scanning Triton radix-select topk (nsa/triton_topk.py, campaign-2
+    # task 11 route B). Same index set as torch.topk, but work scales with
+    # the valid window instead of the static logits buffer width. CUDA-graph
+    # capture safe. Default OFF.
+    SGLANG_NSA_TRITON_TOPK = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

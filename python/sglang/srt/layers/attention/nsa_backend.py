@@ -87,8 +87,15 @@ _NSA_PREFILL_DEQUANT_SCOPE = envs.SGLANG_NSA_PREFILL_DEQUANT_SCOPE.get()
 # import. Default OFF until the decode A/B ladder validates it.
 _NSA_SPLIT_TOPK = envs.SGLANG_NSA_SPLIT_TOPK.get()
 
+# Replace the torch.topk fallback below with the exact seqlen-scanning Triton
+# radix-select topk (nsa/triton_topk.py; campaign-2 task 11 route B).
+# Launch-time toggle, frozen at import. Default OFF.
+_NSA_TRITON_TOPK = envs.SGLANG_NSA_TRITON_TOPK.get()
 
-def _scope_prefill_pool_rows(kv_cache: torch.Tensor, seq_lens_cpu: Optional[torch.Tensor]) -> torch.Tensor:
+
+def _scope_prefill_pool_rows(
+    kv_cache: torch.Tensor, seq_lens_cpu: Optional[torch.Tensor]
+) -> torch.Tensor:
     """Slice the KV pool to the populated row prefix before a full-pool
     dequant hop (SGLANG_NSA_PREFILL_DEQUANT_SCOPE=1, default OFF).
 
@@ -158,14 +165,18 @@ def _torch_fast_topk_v2(score, lengths, topk, row_starts=None, prewindowed=False
     # score values themselves: callers pass uninitialized "dummy" logits on
     # short-sequence paths, which may contain NaN/inf. A NaN at a valid
     # position must still be selectable, so judge validity by position only.
-    masked = torch.where(valid, score.nan_to_num(0.0), torch.full_like(score, float("-inf")))
+    masked = torch.where(
+        valid, score.nan_to_num(0.0), torch.full_like(score, float("-inf"))
+    )
     k = min(topk, L)
     _, idx = masked.topk(k, dim=-1)
     selected_valid = torch.gather(valid, 1, idx)
     if row_starts is not None:
         # window-relative indices, matching the native fast_topk_v2 contract
         idx = idx - rs
-    idx = torch.where(selected_valid, idx.to(torch.int32), idx.new_full((), -1, dtype=torch.int32))
+    idx = torch.where(
+        selected_valid, idx.to(torch.int32), idx.new_full((), -1, dtype=torch.int32)
+    )
     if k < topk:
         idx = torch.nn.functional.pad(idx, (0, topk - k), value=-1)
     return idx
@@ -177,6 +188,17 @@ _fast_topk_v2_impl = None
 def _fast_topk_v2_compat(score, lengths, topk, row_starts=None, prewindowed=False):
     """Use sgl_kernel fast_topk_v2 when it works on this GPU, else torch fallback."""
     global _fast_topk_v2_impl
+
+    if _NSA_TRITON_TOPK:
+        from sglang.srt.layers.attention.nsa.triton_topk import (
+            triton_topk_supports,
+            triton_topk_v2,
+        )
+
+        if triton_topk_supports(score, topk):
+            return triton_topk_v2(
+                score, lengths, topk, row_starts=row_starts, prewindowed=prewindowed
+            )
 
     if _fast_topk_v2_impl is None:
         import logging
@@ -200,7 +222,8 @@ def _fast_topk_v2_compat(score, lengths, topk, row_starts=None, prewindowed=Fals
             except RuntimeError as e:
                 logging.getLogger(__name__).warning(
                     "sgl_kernel fast_topk_v2 unavailable on this GPU (%s); "
-                    "falling back to torch.topk implementation.", e
+                    "falling back to torch.topk implementation.",
+                    e,
                 )
                 # clear the stale CUDA error left by the failed launch
                 torch.cuda.cudart().cudaGetLastError()
@@ -210,6 +233,7 @@ def _fast_topk_v2_compat(score, lengths, topk, row_starts=None, prewindowed=Fals
             score, lengths, topk, row_starts=row_starts, prewindowed=prewindowed
         )
     return _fast_topk_v2_impl(score, lengths, topk, row_starts=row_starts)
+
 
 # Control whether to verify fused metadata copy against individual copies (default: disabled)
 # Set SGLANG_VERIFY_FUSED_METADATA_COPY=1 or true to enable verification
@@ -794,9 +818,16 @@ class NativeSparseAttnBackend(
                     )
                     else cache_seqlens_int32
                 )
-                from sglang.srt.layers.attention.nsa.nsa_indexer import _use_torch_mqa_logits as _utml
-                paged_mqa_schedule_metadata = None if _utml() else deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                from sglang.srt.layers.attention.nsa.nsa_indexer import (
+                    _use_torch_mqa_logits as _utml,
+                )
+
+                paged_mqa_schedule_metadata = (
+                    None
+                    if _utml()
+                    else deep_gemm.get_paged_mqa_logits_metadata(
+                        seqlens_32, 64, deep_gemm.get_num_sms()
+                    )
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -1077,9 +1108,16 @@ class NativeSparseAttnBackend(
                     )
                     else cache_seqlens_int32
                 )
-                from sglang.srt.layers.attention.nsa.nsa_indexer import _use_torch_mqa_logits as _utml
-                paged_mqa_schedule_metadata = None if _utml() else deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                from sglang.srt.layers.attention.nsa.nsa_indexer import (
+                    _use_torch_mqa_logits as _utml,
+                )
+
+                paged_mqa_schedule_metadata = (
+                    None
+                    if _utml()
+                    else deep_gemm.get_paged_mqa_logits_metadata(
+                        seqlens_32, 64, deep_gemm.get_num_sms()
+                    )
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -1247,9 +1285,16 @@ class NativeSparseAttnBackend(
                     )
                     else metadata.cache_seqlens_int32
                 )
-                from sglang.srt.layers.attention.nsa.nsa_indexer import _use_torch_mqa_logits as _utml
-                new_schedule = None if _utml() else deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                from sglang.srt.layers.attention.nsa.nsa_indexer import (
+                    _use_torch_mqa_logits as _utml,
+                )
+
+                new_schedule = (
+                    None
+                    if _utml()
+                    else deep_gemm.get_paged_mqa_logits_metadata(
+                        seqlens_32, 64, deep_gemm.get_num_sms()
+                    )
                 )
                 if new_schedule is None:
                     pass  # torch/Triton mqa-logits path needs no schedule
@@ -2049,7 +2094,9 @@ class NativeSparseAttnBackend(
             else:
                 # Prefill chunk: full-pool dequant amortizes over thousands
                 # of tokens (mirrors the fp8 branch below).
-                kv_cache = dequantize_k_cache_nvfp4(_scope_prefill_pool_rows(kv_cache, seq_lens_cpu))
+                kv_cache = dequantize_k_cache_nvfp4(
+                    _scope_prefill_pool_rows(kv_cache, seq_lens_cpu)
+                )
         elif kv_cache.dtype == torch.float8_e4m3fn:
             from sglang.srt.layers.attention.nsa.dequant_k_cache import (
                 dequantize_k_cache,
@@ -2065,15 +2112,16 @@ class NativeSparseAttnBackend(
                 flat_rows = page_table_1.reshape(-1).clamp_min(0).long()
                 kv_cache = dequantize_k_cache_paged(kv_cache, flat_rows)
                 topk = page_table_1.shape[-1]
-                local = (
-                    torch.arange(nq * topk, device=page_table_1.device, dtype=page_table_1.dtype)
-                    .view(nq, topk)
-                )
+                local = torch.arange(
+                    nq * topk, device=page_table_1.device, dtype=page_table_1.dtype
+                ).view(nq, topk)
                 # preserve -1 padding (kernel masks those slots)
                 page_table_1 = torch.where(page_table_1 >= 0, local, page_table_1)
             else:
                 # Prefill chunk: full-pool dequant amortizes over thousands of tokens.
-                kv_cache = dequantize_k_cache(_scope_prefill_pool_rows(kv_cache, seq_lens_cpu))
+                kv_cache = dequantize_k_cache(
+                    _scope_prefill_pool_rows(kv_cache, seq_lens_cpu)
+                )
 
         if q_all.shape[0] <= 64 and _NSA_SPLIT_TOPK:
             # Decode/verify only: split the 2048-row topk across 128 CTAs
