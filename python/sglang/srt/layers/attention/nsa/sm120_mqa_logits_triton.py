@@ -9,11 +9,27 @@ reads keys/scales straight from the page-blocked index-K buffer via the
 block table — replacing the torch fallback in sm120_mqa_logits.py, which
 gathers every page, expands the full context to bf16, and python-loops the
 matmul. The paged kernel allocates only the [rows, max_seq_len] output.
+
+And an exact two-pass (block-max) top-2048 selection for ragged prefill
+(``two_pass_topk_ragged``; campaign-2 task 13 part 2, gated by
+SGLANG_NSA_TWO_PASS_TOPK) that never materializes the [rows, L] fp32
+logits: pass 1 is the same logits kernel with the store replaced by a
+per-128-key block-max epilogue; pass 2 is the SAME kernel again (same
+BQ/BK/KSPAN tiling, so the recomputed scores are bit-identical to the
+full-logits path) with the store retargeted to a compacted candidate
+buffer holding only the blocks whose max can reach the top-k. A
+per-row BQ=1 recompute kernel was tried first and REJECTED: the
+different dot/reduction layout shifts results by 1-4 ulps on ~31% of
+lanes, which is not exact by construction at the selection boundary.
 """
+
+import logging
 
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -32,6 +48,15 @@ def _mqa_logits_kernel(
     BK: tl.constexpr,
     KSPAN: tl.constexpr,
     FP8_DOT: tl.constexpr,
+    bmax_ptr=None,  # [n_q, nblocks] fp32 block-max out (opt.)
+    nblocks=0,
+    sel_slot_ptr=None,  # [n_q, nblocks] int32 candidate slot (-1 = no)
+    sel_flag_ptr=None,  # [cdiv(n_q, BQ), nblocks] uint8 tile-selected
+    cand_ptr=None,  # [n_q, cand_stride] fp32 candidate scores
+    cand_stride=0,
+    EMIT_LOGITS: tl.constexpr = True,
+    EMIT_BLOCK_MAX: tl.constexpr = False,
+    EMIT_SEL: tl.constexpr = False,
 ):
     # One program owns a [BQ] query tile and sweeps KSPAN consecutive BK-key
     # blocks, so the query tile (and its weights/window bounds) is loaded once
@@ -41,6 +66,15 @@ def _mqa_logits_kernel(
     pid_q = tl.program_id(0)
     pid_s = tl.program_id(1)
     q0 = pid_q * BQ
+    if EMIT_SEL:
+        # Whole-stripe skip: no block of this stripe is selected by any row
+        # of this q-tile (short-window rows skip most stripes).
+        soffs = pid_s * KSPAN + tl.arange(0, KSPAN)
+        sf = tl.load(
+            sel_flag_ptr + pid_q * nblocks + soffs, mask=soffs < nblocks, other=0
+        )
+        if tl.max(sf) == 0:
+            return
     offs_q = q0 + tl.arange(0, BQ)
     qm = offs_q < n_q
     offs_d = tl.arange(0, D)
@@ -62,27 +96,62 @@ def _mqa_logits_kernel(
 
     for s in tl.range(KSPAN):
         k0 = (pid_s * KSPAN + s) * BK
-        offs_k = k0 + tl.arange(0, BK)
-        km = offs_k < n_k
-        k_tile = tl.load(
-            k_ptr + offs_k[None, :] * D + offs_d[:, None],
-            mask=km[None, :],
-            other=0.0,
-        )
-        if not FP8_DOT:
-            k_tile = k_tile.to(tl.bfloat16)
-        s_mat = tl.dot(q_tile, k_tile)          # [BQ*H, BK] fp32
-        s_mat = tl.maximum(s_mat, 0.0) * w[:, None]
-        acc = tl.sum(tl.reshape(s_mat, (BQ, H, BK)), axis=1)  # [BQ, BK]
-        ksc = tl.load(ksc_ptr + offs_k, mask=km, other=0.0)
-        acc *= ksc[None, :]
-        in_win = (offs_k[None, :] >= ks[:, None]) & (offs_k[None, :] < ke[:, None])
-        acc = tl.where(in_win, acc, float("-inf"))
-        tl.store(
-            out_ptr + out_row + offs_k[None, :],
-            acc,
-            mask=qm[:, None] & km[None, :],
-        )
+        run = True
+        if EMIT_SEL:
+            # Per-block skip: not selected by any row of this q-tile.
+            run = tl.load(sel_flag_ptr + pid_q * nblocks + (pid_s * KSPAN + s)) != 0
+        if run:
+            offs_k = k0 + tl.arange(0, BK)
+            km = offs_k < n_k
+            k_tile = tl.load(
+                k_ptr + offs_k[None, :] * D + offs_d[:, None],
+                mask=km[None, :],
+                other=0.0,
+            )
+            if not FP8_DOT:
+                k_tile = k_tile.to(tl.bfloat16)
+            s_mat = tl.dot(q_tile, k_tile)  # [BQ*H, BK] fp32
+            s_mat = tl.maximum(s_mat, 0.0) * w[:, None]
+            acc = tl.sum(tl.reshape(s_mat, (BQ, H, BK)), axis=1)  # [BQ, BK]
+            ksc = tl.load(ksc_ptr + offs_k, mask=km, other=0.0)
+            acc *= ksc[None, :]
+            in_win = (offs_k[None, :] >= ks[:, None]) & (offs_k[None, :] < ke[:, None])
+            acc = tl.where(in_win, acc, float("-inf"))
+            if EMIT_LOGITS:
+                tl.store(
+                    out_ptr + out_row + offs_k[None, :],
+                    acc,
+                    mask=qm[:, None] & km[None, :],
+                )
+            if EMIT_BLOCK_MAX:
+                # One (pid_q, s) iteration covers exactly one BK-key block; the
+                # max excludes lanes past n_k (partial tail block) via km, so a
+                # block max is the max over real in-window scores only (-inf if
+                # the block has none).
+                bmax = tl.max(tl.where(km[None, :], acc, float("-inf")), axis=1)
+                tl.store(
+                    bmax_ptr + offs_q.to(tl.int64) * nblocks + (pid_s * KSPAN + s),
+                    bmax,
+                    mask=qm,
+                )
+            if EMIT_SEL:
+                # Compacted store: block (pid_s*KSPAN+s) goes to candidate slot
+                # sel_slot[q] (its rank among the row's selected blocks), which
+                # keeps candidate keys in ascending order per row. The column
+                # is slot*BK + within-block lane (NOT the global key offset).
+                slots = tl.load(
+                    sel_slot_ptr + offs_q * nblocks + (pid_s * KSPAN + s),
+                    mask=qm,
+                    other=-1,
+                )
+                tl.store(
+                    cand_ptr
+                    + offs_q.to(tl.int64)[:, None] * cand_stride
+                    + slots[:, None] * BK
+                    + tl.arange(0, BK)[None, :],
+                    acc,
+                    mask=qm[:, None] & (slots[:, None] >= 0) & km[None, :],
+                )
 
 
 _FP8_DOT_OK = None
@@ -125,6 +194,198 @@ def triton_fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=True):
     k_fp8, k_scale = kv
     return _run_mqa_logits(q, k_fp8, k_scale, weights, ks, ke,
                            fp8_dot=_fp8_dot_supported())
+
+
+# ---------------------------------------------------------------------------
+# Exact two-pass (block-max) top-k for ragged prefill (campaign-2 task 13
+# part 2). Pass 1 is _mqa_logits_kernel with EMIT_BLOCK_MAX (no logits
+# store); pass 2 is _mqa_logits_kernel again with EMIT_SEL — the SAME
+# BQ/BK/KSPAN tiling, so recomputed scores are bit-identical to the
+# full-logits path — storing only selected blocks, compacted per row.
+# Exactness: at most topk-1 scores exceed the true topk-th score t, so at
+# most topk-1 block maxes exceed t and the topk-th block max tau <= t;
+# every key with score >= t therefore sits in a selected block (max >= tau,
+# intersecting the window) and the candidate topk reproduces the full-row
+# torch.topk set exactly. Ties only inflate the candidate count; rows whose
+# selected-block count exceeds the cap report overflow (return None) so the
+# caller can fall back to full materialization.
+# ---------------------------------------------------------------------------
+
+_TOPK_BLOCK = 128  # keys per selection block (== BK of the logits kernel)
+_SEL_BQ = 4  # pass-2 q-tile rows; MUST match the full-logits kernel tiling
+_SEL_KSPAN = 64  # pass-2 blocks swept per program (== full-logits KSPAN)
+
+
+def triton_fp8_mqa_block_max(q, kv, weights, ks, ke):
+    """Per-128-key block maxes of the MQA logits, [n_q, ceil(n_k/128)] fp32.
+
+    Bit-exact vs the max of the full ``triton_fp8_mqa_logits`` output over
+    each block (same kernel, same scores, logits store elided).
+    """
+    k_fp8, k_scale = kv
+    n_q, H, D = q.shape
+    n_k = k_fp8.shape[0]
+    nblocks = triton.cdiv(n_k, _TOPK_BLOCK)
+    bmax = torch.empty(n_q, nblocks, dtype=torch.float32, device=q.device)
+    BQ, BK, KSPAN = 4, _TOPK_BLOCK, 64
+    grid = (triton.cdiv(n_q, BQ), triton.cdiv(n_k, BK * KSPAN))
+    _mqa_logits_kernel[grid](
+        q,
+        k_fp8,
+        k_scale.to(torch.float32),
+        weights.to(torch.float32),
+        ks.to(torch.int32),
+        ke.to(torch.int32),
+        bmax,  # out_ptr unused
+        n_q,
+        n_k,
+        H=H,
+        D=D,
+        BQ=BQ,
+        BK=BK,
+        KSPAN=KSPAN,
+        FP8_DOT=_fp8_dot_supported(),
+        bmax_ptr=bmax,
+        nblocks=nblocks,
+        EMIT_LOGITS=False,
+        EMIT_BLOCK_MAX=True,
+        num_warps=4,
+        num_stages=2,
+    )
+    return bmax
+
+
+def two_pass_topk_ragged(
+    q, kv, weights, ks, ke, topk, cap_blocks=None, return_debug=False
+):
+    """Exact top-`topk` selection over the ragged MQA logits [n_q, n_k]
+    without materializing the logits.
+
+    Same contract as ``_torch_fast_topk_v2(..., row_starts=ks,
+    prewindowed=True)``: int32 [n_q, topk] window-relative indices, -1 for
+    slots with no valid element. Candidates are stored in ascending key
+    order per row, preserving torch.topk's (value desc, index asc) tie
+    order. Returns None when a row's selected-block count exceeds
+    cap_blocks (pathological ties); the caller must fall back to full
+    materialization then.
+    """
+    k_fp8, k_scale = kv
+    n_q, H, D = q.shape
+    n_k = k_fp8.shape[0]
+    device = q.device
+    nblocks = triton.cdiv(n_k, _TOPK_BLOCK)
+    if cap_blocks is None:
+        cap_blocks = 2 * topk
+    cap_blocks = min(cap_blocks, nblocks)
+    if nblocks == 0 or n_q == 0:
+        return torch.full((n_q, topk), -1, dtype=torch.int32, device=device)
+
+    block_max = triton_fp8_mqa_block_max(q, kv, weights, ks, ke)
+
+    # tau[r] = topk-th largest block max of row r (its min block max when
+    # nblocks < topk, which selects every window block).
+    tau = torch.topk(block_max, min(topk, nblocks), dim=1).values[:, -1:]
+    ks32 = ks.to(torch.int32)
+    ke32 = ke.to(torch.int32)
+    bstart = torch.arange(nblocks, device=device, dtype=torch.int32) * _TOPK_BLOCK
+    in_win_blocks = (bstart[None, :] < ke32[:, None]) & (
+        (bstart[None, :] + _TOPK_BLOCK) > ks32[:, None]
+    )
+    sel_mask = (block_max >= tau) & in_win_blocks
+    # Host sync for the data-dependent candidate width; legal here because
+    # ragged prefill is never CUDA-graph captured.
+    max_sel = int(sel_mask.sum(dim=1).max().item())
+    if max_sel > cap_blocks:
+        logger.warning(
+            "two_pass_topk_ragged: candidate overflow (%d selected blocks "
+            "> cap %d; pathological block-max ties); returning None so the "
+            "caller falls back to full logits materialization.",
+            max_sel,
+            cap_blocks,
+        )
+        return None
+    width_blocks = max(max_sel, 1)
+
+    # Per-row compacted candidate slot of each block (-1 = not selected);
+    # the slot IS the block's rank among selected blocks, so candidate
+    # columns stay in ascending key order per row.
+    csum = sel_mask.to(torch.int32).cumsum(dim=1)
+    sel_slot = torch.where(sel_mask, csum - 1, csum.new_full((), -1))
+    # Per-q-tile any-selected flags let pass 2 skip blocks no row of the
+    # tile selected (most blocks for short-window rows, ~topk/nblocks of
+    # blocks at 1M).
+    n_qt = triton.cdiv(n_q, _SEL_BQ)
+    pad_q = n_qt * _SEL_BQ - n_q
+    sel_padded = (
+        torch.nn.functional.pad(sel_mask, (0, 0, 0, pad_q)) if pad_q else sel_mask
+    )
+    sel_flag = sel_padded.view(n_qt, _SEL_BQ, nblocks).any(dim=1).to(torch.uint8)
+    # slot -> block-id inverse map (ascending per row; nonzero is row-major)
+    # for translating candidate columns back to key indices after the topk.
+    nz = sel_mask.nonzero()
+    inv_slot = torch.full((n_q, width_blocks), -1, dtype=torch.int32, device=device)
+    if nz.numel() > 0:
+        row0 = nz[:, 0]
+        row_start = torch.searchsorted(row0, torch.arange(n_q, device=device))
+        within = torch.arange(nz.shape[0], device=device) - row_start[row0]
+        inv_slot[row0, within] = nz[:, 1].to(torch.int32)
+
+    # Pass 2 writes only selected slots; the rest must read as -inf so the
+    # final topk maps them to -1 exactly like the prewindowed full path.
+    cand = torch.full(
+        (n_q, width_blocks * _TOPK_BLOCK),
+        float("-inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    grid = (n_qt, triton.cdiv(n_k, _TOPK_BLOCK * _SEL_KSPAN))
+    _mqa_logits_kernel[grid](
+        q,
+        k_fp8,
+        k_scale.to(torch.float32),
+        weights.to(torch.float32),
+        ks32,
+        ke32,
+        cand,  # out_ptr unused in EMIT_SEL
+        n_q,
+        n_k,
+        H=H,
+        D=D,
+        BQ=_SEL_BQ,
+        BK=_TOPK_BLOCK,
+        KSPAN=_SEL_KSPAN,
+        FP8_DOT=_fp8_dot_supported(),
+        nblocks=nblocks,
+        sel_slot_ptr=sel_slot,
+        sel_flag_ptr=sel_flag,
+        cand_ptr=cand,
+        cand_stride=width_blocks * _TOPK_BLOCK,
+        EMIT_LOGITS=False,
+        EMIT_SEL=True,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    k = min(topk, cand.shape[1])
+    vals, idx_c = torch.topk(cand, k, dim=1)
+    bid = inv_slot.gather(1, idx_c // _TOPK_BLOCK)
+    gidx = bid.to(torch.int64) * _TOPK_BLOCK + (idx_c % _TOPK_BLOCK)
+    rel = gidx - ks.to(torch.int64)[:, None]
+    out = torch.where(torch.isinf(vals) & (vals < 0), rel.new_full((), -1), rel).to(
+        torch.int32
+    )
+    if k < topk:
+        out = torch.nn.functional.pad(out, (0, topk - k), value=-1)
+    if return_debug:
+        debug = {
+            "block_max": block_max,
+            "sel_blocks": inv_slot,
+            "cand": cand,
+            "max_sel": max_sel,
+            "tau": tau,
+        }
+        return out, debug
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -84,6 +84,14 @@ def _use_torch_mqa_logits() -> bool:
 _SM120_MQA_IMPL = None
 _SM120_PAGED_MQA_IMPL = None
 
+# Exact two-pass (block-max) topk for ragged prefill on sm_120 (campaign-2
+# task 13 part 2). Replaces only the non-fused topk consumer
+# (_fast_topk_v2_compat), so it is disabled when SGLANG_NSA_FUSE_TOPK=1.
+# Launch-time toggle, frozen at import.
+_NSA_TWO_PASS_TOPK = (
+    envs.SGLANG_NSA_TWO_PASS_TOPK.get() and not envs.SGLANG_NSA_FUSE_TOPK.get()
+)
+
 
 def _dispatch_fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=True):
     global _SM120_MQA_IMPL
@@ -577,6 +585,52 @@ class Indexer(MultiPlatformOp):
             topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
 
+    def _two_pass_topk_enabled(self) -> bool:
+        """SGLANG_NSA_TWO_PASS_TOPK applies only to the sm_120 triton/torch
+        MQA logits path (deep_gemm archs and HIP keep their own kernels)."""
+        return _NSA_TWO_PASS_TOPK and not _is_hip and _use_torch_mqa_logits()
+
+    def _two_pass_topk_or_fallback(
+        self,
+        q: torch.Tensor,
+        kv_fp8,
+        weights: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        """Exact block-max two-pass topk (no [rows, L] logits); on candidate
+        overflow (pathological ties) fall back to full materialization so
+        results stay correct."""
+        from sglang.srt.layers.attention.nsa.sm120_mqa_logits_triton import (
+            two_pass_topk_ragged,
+        )
+
+        out = two_pass_topk_ragged(q, kv_fp8, weights, ks, ke, self.index_topk)
+        if out is not None:
+            return out
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "SGLANG_NSA_TWO_PASS_TOPK: candidate overflow; falling back to "
+            "full [rows, L] logits materialization for this call."
+        )
+        with self._with_real_sm_count():
+            logits = _dispatch_fp8_mqa_logits(
+                q, kv_fp8, weights, ks, ke, clean_logits=False
+            )
+        # ke_offset=(ke - ks) keeps the lengths aligned with this (possibly
+        # chunked) slice: topk_transform otherwise defaults to the FULL
+        # seqlens_expanded, which is wrong for a non-zero chunk offset under
+        # the SGLANG_NSA_TRITON_TOPK consumer (lengths are window sizes).
+        return metadata.topk_transform(
+            logits,
+            self.index_topk,
+            ks=ks,
+            ke_offset=(ke - ks).to(torch.int32),
+            prewindowed=(not _is_hip) and _use_torch_mqa_logits(),
+        )
+
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device
     ) -> Tuple[bool, int]:
@@ -589,8 +643,13 @@ class Indexer(MultiPlatformOp):
             return False, 0
 
         free_mem, total_mem = torch.cuda.mem_get_info(device)
-        bytes_per_elem = 4  # float32
-        logits_bytes = num_q * num_k * bytes_per_elem
+        if self._two_pass_topk_enabled():
+            # Two-pass footprint per row: capped candidate buffer
+            # (2*topk blocks x 128 keys fp32) + block maxes, not [num_k] fp32.
+            nblocks = -(-num_k // 128)
+            logits_bytes = num_q * (2 * self.index_topk * 128 + nblocks) * 4
+        else:
+            logits_bytes = num_q * num_k * 4  # float32
 
         # Logits should not exceed 50% of free memory or 30% of total memory
         need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
@@ -669,6 +728,13 @@ class Indexer(MultiPlatformOp):
 
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
+            if self._two_pass_topk_enabled():
+                # Exact block-max two-pass topk: no [rows, L] logits at all
+                # (falls back to full materialization on candidate overflow).
+                topk_result[:q_offset] = self._two_pass_topk_or_fallback(
+                    q_fp8[:q_offset], kv_fp8, weights[:q_offset], ks, ke, metadata
+                )
+                return topk_result
             with self._with_real_sm_count():
                 if _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -700,6 +766,12 @@ class Indexer(MultiPlatformOp):
         # Chunk path
         bytes_per_elem = 4  # float32
         bytes_per_row = k_offset * bytes_per_elem
+        if self._two_pass_topk_enabled():
+            # Two-pass footprint per row: capped candidate buffer
+            # (2*topk blocks x 128 keys fp32) + block maxes — ~1.1 MB at 1M
+            # vs ~3.8 MB for the full logits row.
+            nblocks = -(-k_offset // 128)
+            bytes_per_row = (2 * self.index_topk * 128 + nblocks) * bytes_per_elem
         # Reserve 50% of free memory for logits
         max_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
         max_rows = min(max_rows, q_offset)
@@ -717,6 +789,20 @@ class Indexer(MultiPlatformOp):
         start = 0
         while start < q_offset:
             end = min(start + max_rows, q_offset)
+
+            if self._two_pass_topk_enabled():
+                # Exact block-max two-pass topk per chunk (falls back to
+                # full materialization on candidate overflow).
+                topk_result[start:end] = self._two_pass_topk_or_fallback(
+                    q_fp8[start:end],
+                    kv_fp8,
+                    weights[start:end],
+                    ks[start:end],
+                    ke[start:end],
+                    metadata,
+                )
+                start = end
+                continue
 
             with self._with_real_sm_count():
                 if _is_hip:

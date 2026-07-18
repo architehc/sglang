@@ -417,6 +417,17 @@ class Envs:
     # 12). A/B escape hatch; the fused path is numerics-equivalent. Default
     # OFF (fused). Ignored off sm_120, where the hop is always kept.
     SGLANG_NSA_DEQUANT_HOP = EnvBool(False)
+    # Exact two-pass (block-max) topk for NSA ragged prefill on sm_120
+    # (campaign-2 task 13 part 2). Pass 1 emits per-128-key block maxes from
+    # the MQA logits kernel instead of the full [rows, L] fp32 logits; the
+    # 2048th block-max is a lower bound on the true top-2048 threshold, so
+    # pass 2 recomputes scores only for blocks that can contain the top-k
+    # into a capped candidate buffer (exact by construction; pathological
+    # ties that overflow the cap fall back to full materialization with a
+    # loud log). Only meaningful with the non-fused topk consumer
+    # (SGLANG_NSA_FUSE_TOPK=0, the sm_120 production config); no-op on HIP
+    # and on deep_gemm archs (sm90/sm100). Default OFF.
+    SGLANG_NSA_TWO_PASS_TOPK = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
