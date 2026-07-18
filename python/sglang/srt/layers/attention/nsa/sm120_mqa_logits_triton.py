@@ -24,12 +24,51 @@ lanes, which is not exact by construction at the selection boundary.
 """
 
 import logging
+import os
 
 import torch
 import triton
 import triton.language as tl
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Shared prefill-logits tiling (campaign-2 task 10 winner; sweep harness:
+# blackwell/scripts/mqa_logits_sweep.py, results:
+# blackwell/docs/mqa_logits_tile_sweep.md). One program owns a [BQ]-query
+# tile and sweeps KSPAN consecutive BK-key blocks per K-stripe. warps=8 +
+# stages=4 took the kernel from ~220 to ~305 TFLOPS effective at both sweep
+# regimes (rows=2048/L=900k, rows=8192/L=250k); KSPAN was flat within
+# noise, BQ>4 spills registers or OOMs smem. The block-max pass and the
+# pass-2 SEL recompute of two_pass_topk_ragged MUST launch with the SAME
+# (BQ, BK, KSPAN, warps, stages): their recomputed scores are only
+# bit-identical to the full-logits path under identical tiling (warps 4->8
+# alone shifts results by ~2e-7 rel; a BQ=1 recompute by 1-4 ulps on ~31%
+# of lanes). SGLANG_MQA_TUNE="BQ,BK,KSPAN,warps,stages" overrides all three
+# call sites together; a DEV tile-sweep knob only, production uses the
+# constants below.
+# ---------------------------------------------------------------------------
+_MQA_BQ = 4
+_MQA_BK = 128
+_MQA_KSPAN = 64
+_MQA_WARPS = 8
+_MQA_STAGES = 4
+
+
+def _mqa_tile_config():
+    """(BQ, BK, KSPAN, num_warps, num_stages) shared by the prefill logits
+    kernel and both two-pass kernels (bit-identity, see above)."""
+    raw = os.environ.get("SGLANG_MQA_TUNE")
+    if raw:
+        try:
+            cfg = tuple(int(x) for x in raw.split(","))
+            if len(cfg) == 5 and all(c > 0 for c in cfg):
+                return cfg
+            raise ValueError
+        except ValueError:
+            logger.warning("ignoring malformed SGLANG_MQA_TUNE=%r", raw)
+    return _MQA_BQ, _MQA_BK, _MQA_KSPAN, _MQA_WARPS, _MQA_STAGES
 
 
 @triton.jit
@@ -179,13 +218,13 @@ def _run_mqa_logits(q, k_fp8, k_scale, weights, ks, ke, fp8_dot):
     n_q, H, D = q.shape
     n_k = k_fp8.shape[0]
     out = torch.empty(n_q, n_k, dtype=torch.float32, device=q.device)
-    BQ, BK, KSPAN = 4, 128, 64
+    BQ, BK, KSPAN, warps, stages = _mqa_tile_config()
     grid = (triton.cdiv(n_q, BQ), triton.cdiv(n_k, BK * KSPAN))
     _mqa_logits_kernel[grid](
         q, k_fp8, k_scale.to(torch.float32), weights.to(torch.float32),
         ks.to(torch.int32), ke.to(torch.int32), out,
         n_q, n_k, H=H, D=D, BQ=BQ, BK=BK, KSPAN=KSPAN, FP8_DOT=fp8_dot,
-        num_warps=4, num_stages=2,
+        num_warps=warps, num_stages=stages,
     )
     return out
 
@@ -211,9 +250,9 @@ def triton_fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=True):
 # caller can fall back to full materialization.
 # ---------------------------------------------------------------------------
 
-_TOPK_BLOCK = 128  # keys per selection block (== BK of the logits kernel)
-_SEL_BQ = 4  # pass-2 q-tile rows; MUST match the full-logits kernel tiling
-_SEL_KSPAN = 64  # pass-2 blocks swept per program (== full-logits KSPAN)
+_TOPK_BLOCK = _MQA_BK  # keys per selection block (== BK of the logits kernel)
+_SEL_BQ = _MQA_BQ  # pass-2 q-tile rows; MUST match the full-logits kernel tiling
+_SEL_KSPAN = _MQA_KSPAN  # pass-2 blocks swept per program (== full-logits KSPAN)
 
 
 def triton_fp8_mqa_block_max(q, kv, weights, ks, ke):
@@ -225,9 +264,9 @@ def triton_fp8_mqa_block_max(q, kv, weights, ks, ke):
     k_fp8, k_scale = kv
     n_q, H, D = q.shape
     n_k = k_fp8.shape[0]
-    nblocks = triton.cdiv(n_k, _TOPK_BLOCK)
+    BQ, BK, KSPAN, warps, stages = _mqa_tile_config()
+    nblocks = triton.cdiv(n_k, BK)
     bmax = torch.empty(n_q, nblocks, dtype=torch.float32, device=q.device)
-    BQ, BK, KSPAN = 4, _TOPK_BLOCK, 64
     grid = (triton.cdiv(n_q, BQ), triton.cdiv(n_k, BK * KSPAN))
     _mqa_logits_kernel[grid](
         q,
@@ -249,8 +288,8 @@ def triton_fp8_mqa_block_max(q, kv, weights, ks, ke):
         nblocks=nblocks,
         EMIT_LOGITS=False,
         EMIT_BLOCK_MAX=True,
-        num_warps=4,
-        num_stages=2,
+        num_warps=warps,
+        num_stages=stages,
     )
     return bmax
 
@@ -273,7 +312,9 @@ def two_pass_topk_ragged(
     n_q, H, D = q.shape
     n_k = k_fp8.shape[0]
     device = q.device
-    nblocks = triton.cdiv(n_k, _TOPK_BLOCK)
+    # Same tiling as the full-logits kernel (bit-identity, see module notes).
+    BQ, BK, KSPAN, warps, stages = _mqa_tile_config()
+    nblocks = triton.cdiv(n_k, BK)
     if cap_blocks is None:
         cap_blocks = 2 * topk
     cap_blocks = min(cap_blocks, nblocks)
@@ -287,9 +328,9 @@ def two_pass_topk_ragged(
     tau = torch.topk(block_max, min(topk, nblocks), dim=1).values[:, -1:]
     ks32 = ks.to(torch.int32)
     ke32 = ke.to(torch.int32)
-    bstart = torch.arange(nblocks, device=device, dtype=torch.int32) * _TOPK_BLOCK
+    bstart = torch.arange(nblocks, device=device, dtype=torch.int32) * BK
     in_win_blocks = (bstart[None, :] < ke32[:, None]) & (
-        (bstart[None, :] + _TOPK_BLOCK) > ks32[:, None]
+        (bstart[None, :] + BK) > ks32[:, None]
     )
     sel_mask = (block_max >= tau) & in_win_blocks
     # Host sync for the data-dependent candidate width; legal here because
@@ -314,12 +355,12 @@ def two_pass_topk_ragged(
     # Per-q-tile any-selected flags let pass 2 skip blocks no row of the
     # tile selected (most blocks for short-window rows, ~topk/nblocks of
     # blocks at 1M).
-    n_qt = triton.cdiv(n_q, _SEL_BQ)
-    pad_q = n_qt * _SEL_BQ - n_q
+    n_qt = triton.cdiv(n_q, BQ)
+    pad_q = n_qt * BQ - n_q
     sel_padded = (
         torch.nn.functional.pad(sel_mask, (0, 0, 0, pad_q)) if pad_q else sel_mask
     )
-    sel_flag = sel_padded.view(n_qt, _SEL_BQ, nblocks).any(dim=1).to(torch.uint8)
+    sel_flag = sel_padded.view(n_qt, BQ, nblocks).any(dim=1).to(torch.uint8)
     # slot -> block-id inverse map (ascending per row; nonzero is row-major)
     # for translating candidate columns back to key indices after the topk.
     nz = sel_mask.nonzero()
@@ -333,12 +374,12 @@ def two_pass_topk_ragged(
     # Pass 2 writes only selected slots; the rest must read as -inf so the
     # final topk maps them to -1 exactly like the prewindowed full path.
     cand = torch.full(
-        (n_q, width_blocks * _TOPK_BLOCK),
+        (n_q, width_blocks * BK),
         float("-inf"),
         dtype=torch.float32,
         device=device,
     )
-    grid = (n_qt, triton.cdiv(n_k, _TOPK_BLOCK * _SEL_KSPAN))
+    grid = (n_qt, triton.cdiv(n_k, BK * KSPAN))
     _mqa_logits_kernel[grid](
         q,
         k_fp8,
@@ -351,25 +392,25 @@ def two_pass_topk_ragged(
         n_k,
         H=H,
         D=D,
-        BQ=_SEL_BQ,
-        BK=_TOPK_BLOCK,
-        KSPAN=_SEL_KSPAN,
+        BQ=BQ,
+        BK=BK,
+        KSPAN=KSPAN,
         FP8_DOT=_fp8_dot_supported(),
         nblocks=nblocks,
         sel_slot_ptr=sel_slot,
         sel_flag_ptr=sel_flag,
         cand_ptr=cand,
-        cand_stride=width_blocks * _TOPK_BLOCK,
+        cand_stride=width_blocks * BK,
         EMIT_LOGITS=False,
         EMIT_SEL=True,
-        num_warps=4,
-        num_stages=2,
+        num_warps=warps,
+        num_stages=stages,
     )
 
     k = min(topk, cand.shape[1])
     vals, idx_c = torch.topk(cand, k, dim=1)
-    bid = inv_slot.gather(1, idx_c // _TOPK_BLOCK)
-    gidx = bid.to(torch.int64) * _TOPK_BLOCK + (idx_c % _TOPK_BLOCK)
+    bid = inv_slot.gather(1, idx_c // BK)
+    gidx = bid.to(torch.int64) * BK + (idx_c % BK)
     rel = gidx - ks.to(torch.int64)[:, None]
     out = torch.where(torch.isinf(vals) & (vals < 0), rel.new_full((), -1), rel).to(
         torch.int32
