@@ -2166,7 +2166,7 @@ def _nsa_fused_kv_args(kv: torch.Tensor, kv_dtype: str, d_v: int, tail_dim: int)
     """
     if kv_dtype == "bfloat16":
         return (
-            kv,
+            kv.unsqueeze(0),
             _fused_slot_dummy(kv.device, FP8_),
             _fused_slot_dummy(kv.device, torch.float32),
             _fused_slot_dummy(kv.device, torch.bfloat16),
