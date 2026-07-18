@@ -1902,7 +1902,9 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             return (
                 get_global_server_args().nsa_decode_backend == "trtllm"
                 or get_global_server_args().nsa_prefill_backend == "trtllm"
-            ) and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
+            ) and getattr(
+                forward_batch.attn_backend, "kv_cache_dtype", None
+            ) == torch.float8_e4m3fn
 
         return (
             self.current_attention_backend == "trtllm_mla"
