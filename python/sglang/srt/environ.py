@@ -398,6 +398,12 @@ class Envs:
     # server, prefix-growing requests); see _scope_prefill_pool_rows in
     # nsa_backend.py. Default OFF.
     SGLANG_NSA_PREFILL_DEQUANT_SCOPE = EnvBool(False)
+    # Route tilelang NSA decode (nq<=64) through the split-topk
+    # partial+combine kernels (32 topk blocks x 4 head CTAs = 128 CTAs vs the
+    # single-pass kernel's 4). Prefill (nq>64) never routes there: partial
+    # traffic would scale with token count. Default OFF pending the decode
+    # A/B ladder (campaign-2 task 9).
+    SGLANG_NSA_SPLIT_TOPK = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

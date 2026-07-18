@@ -1619,11 +1619,17 @@ def sparse_mla_fwd_decode_partial(
     sm_scale=None,
     is_causal=True,
     block_I=64,
-    threads=256,
+    threads=None,
+    kv_dtype="bfloat16",
 ):
     """
     grid: (seq_len * REPLICATE_H, top_k_blocks).
     Each block does one topk block, writes partial_o, partial_lse.
+
+    sm_120 geometry (see the v1 smem table above): H_per_block=16,
+    REPLICATE_H=4, threads=128 -> 94,208 B smem (same tiles as v1-h16), so
+    the decode grid is (seq_len*4, NI=32) = 128 CTAs. Larger-smem parts keep
+    the original H64 geometry (threads=256, 155,648 B).
     """
 
     assert is_causal == True, "non-causal is not supported"
@@ -1642,8 +1648,25 @@ def sparse_mla_fwd_decode_partial(
 
     head_kv = heads // kv_group
     padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
-    REPLICATE_H = (head_kv // 64) if head_kv > 64 else 1
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    # Same sm_120 smem-cap geometry selector as v1: 16 heads/block keeps the
+    # Q/KV/tail/S tiles at 94,208 B (< 99 KB opt-in cap); H64 needs 155,648 B
+    # and only fits Hopper-class smem.
+    _h_split = 64
+    try:
+        import torch as _t
+
+        if _t.cuda.get_device_capability()[0] >= 12:
+            _h_split = 16
+    except Exception:
+        pass
+    if threads is None:
+        threads = 128 if _h_split == 16 else 256
+    if head_kv > _h_split:
+        assert head_kv % _h_split == 0, "head_kv should be a multiple of the head split"
+        REPLICATE_H = head_kv // _h_split
+    else:
+        REPLICATE_H = 1
+    H_per_block = padded_H if REPLICATE_H == 1 else _h_split
     BI = block_I
     NI = topk // block_I
     D = dim
@@ -1661,7 +1684,7 @@ def sparse_mla_fwd_decode_partial(
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),
-        KV: T.Tensor(kv_shape, dtype),
+        KV: T.Tensor(kv_shape, kv_dtype),
         Indices: T.Tensor(indices_shape, indices_dtype),
         Partial_O: T.Tensor(partial_o_shape, dtype),
         Partial_Lse: T.Tensor(partial_lse_shape, accum_dtype),
@@ -1686,7 +1709,7 @@ def sparse_mla_fwd_decode_partial(
             topk_block_i = by
             q_i = s_i
 
-            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64
+            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
@@ -1694,13 +1717,24 @@ def sparse_mla_fwd_decode_partial(
 
             for bi_i in T.Parallel(BI):
                 mask[bi_i] = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i] >= 0
+
+            # Clamp the gather index (same idiom as v1): production index
+            # pages are padded with -1, which would otherwise read out of
+            # bounds. The masked row above contributes exp2(-inf) = 0 either
+            # way, so clamping to row 0 is numerically inert.
             for bi_i, d_i in T.Parallel(BI, D):
                 KV_shared[bi_i, d_i] = KV[
-                    b_i, Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], g_i, d_i
+                    b_i,
+                    T.max(Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], 0),
+                    g_i,
+                    d_i,
                 ]
             for bi_i, d_i in T.Parallel(BI, D_tail):
                 K_tail_shared[bi_i, d_i] = KV[
-                    b_i, Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], g_i, D + d_i
+                    b_i,
+                    T.max(Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], 0),
+                    g_i,
+                    D + d_i,
                 ]
             for h_i, bi_i in T.Parallel(H_per_block, BI):
                 acc_s[h_i, bi_i] = T.if_then_else(
@@ -1921,6 +1955,40 @@ def tilelang_sparse_fwd(
             num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
         )
     return kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
+
+
+def tilelang_sparse_fwd_split_topk(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+) -> torch.Tensor:
+    """Split-topk decode path (sm_120): the 2048-row topk is split into NI=32
+    index blocks across (seq_len*4, 32) = 128 CTAs (vs the single-pass
+    kernel's 4), each writing bf16 partials; a combine pass then merges the 32
+    splits per head. Same interface and output shape as tilelang_sparse_fwd.
+    bf16 KV only (fp8 pool folding is campaign-2 Task 12).
+    """
+    assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
+    num_heads = q.shape[1]
+    dim = q.shape[2]
+    tail_dim = dim - d_v
+    topk = indices.shape[-1]
+    assert topk == 2048
+    kv_dtype = "float8_e4m3" if kv.dtype == torch.float8_e4m3fn else "bfloat16"
+    assert kv_dtype == "bfloat16", (
+        "fp8 pool read without per-128-block scale folding is numerically wrong; "
+        "dequantize first or implement scale folding (campaign-2 Task 12)"
+    )
+    partial = sparse_mla_fwd_decode_partial(
+        num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, kv_dtype=kv_dtype,
+    )
+    combine = sparse_mla_fwd_decode_combine(num_heads, d_v, topk, head_per_block=16)
+    partial_o, partial_lse = partial(
+        q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
+    )
+    return combine(partial_o, partial_lse)
 
 
 @functools.cache

@@ -82,6 +82,11 @@ _NSA_FUSE_TOPK = envs.SGLANG_NSA_FUSE_TOPK.get()
 # (default: disabled). Launch-time toggle, frozen at import.
 _NSA_PREFILL_DEQUANT_SCOPE = envs.SGLANG_NSA_PREFILL_DEQUANT_SCOPE.get()
 
+# Route tilelang decode (nq<=64) through the split-topk partial+combine
+# kernels (128 CTAs vs 4; campaign-2 task 9). Launch-time toggle, frozen at
+# import. Default OFF until the decode A/B ladder validates it.
+_NSA_SPLIT_TOPK = envs.SGLANG_NSA_SPLIT_TOPK.get()
+
 
 def _scope_prefill_pool_rows(kv_cache: torch.Tensor, seq_lens_cpu: Optional[torch.Tensor]) -> torch.Tensor:
     """Slice the KV pool to the populated row prefix before a full-pool
@@ -2069,6 +2074,22 @@ class NativeSparseAttnBackend(
             else:
                 # Prefill chunk: full-pool dequant amortizes over thousands of tokens.
                 kv_cache = dequantize_k_cache(_scope_prefill_pool_rows(kv_cache, seq_lens_cpu))
+
+        if q_all.shape[0] <= 64 and _NSA_SPLIT_TOPK:
+            # Decode/verify only: split the 2048-row topk across 128 CTAs
+            # (partial) + a combine pass. Prefill (nq>64) must not route
+            # here: partial traffic would scale with token count.
+            from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+                tilelang_sparse_fwd_split_topk,
+            )
+
+            return tilelang_sparse_fwd_split_topk(
+                q=q_all,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+            )
 
         return tilelang_sparse_fwd(
             q=q_all,
