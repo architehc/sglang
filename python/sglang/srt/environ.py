@@ -410,6 +410,13 @@ class Envs:
     # the valid window instead of the static logits buffer width. CUDA-graph
     # capture safe. Default OFF.
     SGLANG_NSA_TRITON_TOPK = EnvBool(False)
+    # Force the legacy dequant hop (gather+dequant of the top-k pool rows
+    # into a bf16 buffer + arange/where local index remap) before the
+    # tilelang NSA attention kernels, instead of the default fused
+    # dequant-in-gather read of fp8/NVFP4 pool rows (sm_120, campaign-2 task
+    # 12). A/B escape hatch; the fused path is numerics-equivalent. Default
+    # OFF (fused). Ignored off sm_120, where the hop is always kept.
+    SGLANG_NSA_DEQUANT_HOP = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

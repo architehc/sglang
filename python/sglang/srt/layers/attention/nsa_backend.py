@@ -87,6 +87,12 @@ _NSA_PREFILL_DEQUANT_SCOPE = envs.SGLANG_NSA_PREFILL_DEQUANT_SCOPE.get()
 # import. Default OFF until the decode A/B ladder validates it.
 _NSA_SPLIT_TOPK = envs.SGLANG_NSA_SPLIT_TOPK.get()
 
+# Force the legacy dequant hop (gather+dequant to a bf16 buffer + local
+# index remap) before the tilelang NSA attention kernels instead of the
+# default fused dequant-in-gather read of fp8/NVFP4 pool rows (campaign-2
+# task 12; A/B escape hatch). Launch-time toggle, frozen at import.
+_NSA_DEQUANT_HOP = envs.SGLANG_NSA_DEQUANT_HOP.get()
+
 # Replace the torch.topk fallback below with the exact seqlen-scanning Triton
 # radix-select topk (nsa/triton_topk.py; campaign-2 task 11 route B).
 # Launch-time toggle, frozen at import. Default OFF.
@@ -2065,11 +2071,24 @@ class NativeSparseAttnBackend(
         sm_scale: float,
         seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.attention.nsa.tilelang_kernel import tilelang_sparse_fwd
+        from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+            nsa_tilelang_fused_dequant_supported,
+            tilelang_sparse_fwd,
+        )
+
+        # Fused dequant-in-gather (campaign-2 task 12): on sm_120 the
+        # tilelang kernels read fp8/NVFP4 pool rows directly with the quant
+        # scales folded into the gather, so the dequant hop AND the
+        # arange/where local index remap below are skipped entirely — the
+        # kernel consumes the raw page_table_1 pool-row indices. Default ON
+        # for these validated dtypes; SGLANG_NSA_DEQUANT_HOP=1 forces the
+        # legacy hop for A/B. Non-sm_120 devices (Hopper v2, HIP) always
+        # take the hop since their kernels don't fold scales.
+        hop = _NSA_DEQUANT_HOP or not nsa_tilelang_fused_dequant_supported()
 
         # NVFP4 pool: kv_cache is a float8_e4m3fn VIEW of 328-byte NVFP4 rows,
         # so this branch must run before the fp8 dtype check below.
-        if self.nsa_kv_cache_store_nvfp4:
+        if self.nsa_kv_cache_store_nvfp4 and hop:
             from sglang.srt.layers.attention.nsa.nvfp4_kv_cache import (
                 dequantize_k_cache_nvfp4,
                 dequantize_k_cache_nvfp4_paged,
@@ -2097,7 +2116,7 @@ class NativeSparseAttnBackend(
                 kv_cache = dequantize_k_cache_nvfp4(
                     _scope_prefill_pool_rows(kv_cache, seq_lens_cpu)
                 )
-        elif kv_cache.dtype == torch.float8_e4m3fn:
+        elif kv_cache.dtype == torch.float8_e4m3fn and hop:
             from sglang.srt.layers.attention.nsa.dequant_k_cache import (
                 dequantize_k_cache,
             )

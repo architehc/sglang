@@ -43,6 +43,21 @@ def fast_pow2(x):
     return T.reinterpret("float32", bits_x)
 
 
+def _e2m1_decode_tl(nib):
+    """Decode an e2m1 nibble code (int32 PrimExpr in [0, 16)) to an f32
+    PrimExpr. Same arithmetic as the triton reference `_e2m1_decode` in
+    nsa/nvfp4_kv_cache.py; all magnitudes are exact in f32, so the result is
+    bit-identical regardless of evaluation order.
+    """
+    m = nib & 7
+    mag = T.if_then_else(
+        m < 2,
+        0.5 * m.astype(FP32),
+        (1.0 + 0.5 * (m & 1).astype(FP32)) * fast_pow2((m >> 1) - 1),
+    )
+    return T.if_then_else((nib & 8) != 0, -1.0, 1.0) * mag
+
+
 def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
 
@@ -286,10 +301,54 @@ def sparse_attention_fwd_kernel_v1(
 
     H_per_block = padded_H if REPLICATE_H == 1 else _h_split
 
+    # Unified fused-dequant signature (campaign-2 task 12): every layout is
+    # called with (KV, KV_nope, KV_scale, KV_rope, KV_rs); slots unused by
+    # the active layout receive a cached 1-element dummy from the wrapper
+    # (_nsa_fused_kv_args) and are never read below (compile-time kv_dtype
+    # branches).
+    #   bfloat16:      KV = dense [batch, N, kv_group, 576] (legacy path)
+    #   float8_e4m3:   KV_nope fp8 [N, 512], KV_scale f32 [N, 4] (per-128
+    #                  block scales), KV_rope bf16 [N, 64] (stored raw)
+    #   nvfp4:         KV_nope u8 [N, 256] packed e2m1, KV_scale fp8 [N, 32]
+    #                  (per-16 scales), KV_rope u8 [N, 32], KV_rs fp8 [N, 4]
+    d_n, d_s, d_r, d_x, d_z = T.dynamic("d_n, d_s, d_r, d_x, d_z")
+    _gs = 1.0
+    if kv_dtype == "bfloat16":
+        ann_kv = T.Tensor(kv_shape, kv_dtype)
+        ann_nope = T.Tensor([d_z], FP8)
+        ann_scale = T.Tensor([d_z], FP32)
+        ann_rope = T.Tensor([d_z], dtype)
+        ann_rs = T.Tensor([d_z], FP8)
+    elif kv_dtype == "float8_e4m3":
+        assert D % 128 == 0, "fp8 layout needs per-128-block scales"
+        ann_kv = T.Tensor([d_z], FP8)
+        ann_nope = T.StridedTensor([seq_len_kv, D], [d_n, 1], FP8)
+        ann_scale = T.StridedTensor([seq_len_kv, D // 128], [d_s, 1], FP32)
+        ann_rope = T.StridedTensor([seq_len_kv, D_tail], [d_r, 1], dtype)
+        ann_rs = T.Tensor([d_z], FP8)
+    elif kv_dtype == "nvfp4":
+        from sglang.srt.layers.attention.nsa.nvfp4_kv_cache import (
+            nvfp4_global_scale,
+        )
+
+        assert D % 16 == 0 and D_tail % 16 == 0, "nvfp4 needs per-16 blocks"
+        _gs = nvfp4_global_scale()
+        ann_kv = T.Tensor([d_z], FP8)
+        ann_nope = T.StridedTensor([seq_len_kv, D // 2], [d_n, 1], "uint8")
+        ann_scale = T.StridedTensor([seq_len_kv, D // 16], [d_s, 1], FP8)
+        ann_rope = T.StridedTensor([seq_len_kv, D_tail // 2], [d_r, 1], "uint8")
+        ann_rs = T.StridedTensor([seq_len_kv, D_tail // 16], [d_x, 1], FP8)
+    else:
+        raise ValueError(f"unsupported kv_dtype {kv_dtype!r}")
+
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
-        KV: T.Tensor(kv_shape, kv_dtype),  # type: ignore
+        KV: ann_kv,  # type: ignore
+        KV_nope: ann_nope,  # type: ignore
+        KV_scale: ann_scale,  # type: ignore
+        KV_rope: ann_rope,  # type: ignore
+        KV_rs: ann_rs,  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
@@ -322,7 +381,9 @@ def sparse_attention_fwd_kernel_v1(
             q_i = s_i
             max_kv_i = q_i
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block)
+            H0 = g_i * padded_H + (
+                0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block
+            )
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
@@ -336,21 +397,69 @@ def sparse_attention_fwd_kernel_v1(
                 # Clamp the gather index: production index pages are padded
                 # with -1, which would otherwise read out of bounds. The
                 # masked row below contributes exp2(-inf) = 0 either way, so
-                # clamping to row 0 is numerically inert.
-                for bi_i, d_i in T.Parallel(BI, D):
-                    KV_shared[bi_i, d_i] = KV[
-                        b_i,
-                        T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
-                        g_i,
-                        d_i,
-                    ]
-                for bi_i, d_i in T.Parallel(BI, D_tail):
-                    K_tail_shared[bi_i, d_i] = KV[
-                        b_i,
-                        T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
-                        g_i,
-                        D + d_i,
-                    ]
+                # clamping to row 0 is numerically inert. The fused quant
+                # layouts read values/scales/packed bytes from the same
+                # clamped row, so the guard row needs no special scales.
+                if kv_dtype == "bfloat16":
+                    for bi_i, d_i in T.Parallel(BI, D):
+                        KV_shared[bi_i, d_i] = KV[
+                            b_i,
+                            T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
+                            g_i,
+                            d_i,
+                        ]
+                    for bi_i, d_i in T.Parallel(BI, D_tail):
+                        K_tail_shared[bi_i, d_i] = KV[
+                            b_i,
+                            T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0),
+                            g_i,
+                            D + d_i,
+                        ]
+                elif kv_dtype == "float8_e4m3":
+                    # Fused dequant-in-gather (campaign-2 task 12): fold the
+                    # per-128-block scales into the gather in the same order
+                    # as the triton reference (nsa/dequant_k_cache.py):
+                    #   bf16(f32(fp8) * f32(scale[d // 128]))
+                    # so the bf16 smem tiles are bit-identical to the old
+                    # dequant-hop buffer. The rope tail is stored raw bf16.
+                    for bi_i, d_i in T.Parallel(BI, D):
+                        row_i = T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0)
+                        KV_shared[bi_i, d_i] = (
+                            KV_nope[row_i, d_i].astype(FP32)
+                            * KV_scale[row_i, d_i // 128]
+                        ).astype(dtype)
+                    for bi_i, d_i in T.Parallel(BI, D_tail):
+                        row_i = T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0)
+                        K_tail_shared[bi_i, d_i] = KV_rope[row_i, d_i]
+                else:  # kv_dtype == "nvfp4"
+                    # Fused NVFP4 dequant-in-gather: nibble unpack + e2m1
+                    # decode + per-16 fp8 scales, same order as the triton
+                    # reference (nsa/nvfp4_kv_cache.py):
+                    #   s = f32(fp8_scale) * GLOBAL_SCALE; bf16(e2m1 * s)
+                    for bi_i, d_i in T.Parallel(BI, D):
+                        row_i = T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0)
+                        KV_shared[bi_i, d_i] = (
+                            _e2m1_decode_tl(
+                                (
+                                    KV_nope[row_i, d_i // 2].astype("int32")
+                                    >> ((d_i & 1) * 4)
+                                )
+                                & 15
+                            )
+                            * (KV_scale[row_i, d_i // 16].astype(FP32) * _gs)
+                        ).astype(dtype)
+                    for bi_i, d_i in T.Parallel(BI, D_tail):
+                        row_i = T.max(Indices[b_i, s_i, g_i, i_i * BI + bi_i], 0)
+                        K_tail_shared[bi_i, d_i] = (
+                            _e2m1_decode_tl(
+                                (
+                                    KV_rope[row_i, d_i // 2].astype("int32")
+                                    >> ((d_i & 1) * 4)
+                                )
+                                & 15
+                            )
+                            * (KV_rs[row_i, d_i // 16].astype(FP32) * _gs)
+                        ).astype(dtype)
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
@@ -404,8 +513,11 @@ def sparse_attention_fwd_kernel_v1(
 # | h32p.
 #
 # Shared-memory budget (bytes, bf16 tiles, single-buffered i.e. num_stages=1).
-# All gemm operand tiles are bf16 even on the fp8-KV path: the indexed gather
-# copy casts fp8 -> bf16 elementwise into KV_shared/K_tail_shared. Accumulators
+# All gemm operand tiles are bf16 even on the quant-KV paths: the indexed
+# gather dequantizes elementwise into KV_shared/K_tail_shared (fp8: f32(fp8)
+# * per-128 scale -> bf16; NVFP4: e2m1 * per-16 fp8 scale -> bf16; campaign-2
+# task 12, h16/split-topk only — the h32* variants below stay bf16-only).
+# Accumulators
 # (acc_o, acc_s) and softmax stats (m_i, sumexp, alpha, ...) are register
 # fragments, not smem (except in h32/h32p, see the + footnote below). v1's
 # dead O_shared (acc_o goes straight to global) has been removed.
@@ -504,6 +616,11 @@ def sparse_attention_fwd_kernel_v1_h32(
     single-buffered. Structure is v1 apart from the geometry and the
     shared-memory softmax state (see alloc comment below).
     """
+    assert kv_dtype == "bfloat16", (
+        "the h32 geometry does not fold quant scales; use v1-h16 or the "
+        "split-topk partial for fused fp8/NVFP4 pool reads (campaign-2 "
+        "task 12)"
+    )
     assert dim == tilelang.math.next_power_of_2(
         dim
     ), f"haven't check padding correctness yet, dim={dim}"
@@ -597,7 +714,9 @@ def sparse_attention_fwd_kernel_v1_h32(
             q_i = s_i
             max_kv_i = q_i
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block)
+            H0 = g_i * padded_H + (
+                0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block
+            )
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
@@ -712,6 +831,11 @@ def sparse_attention_fwd_kernel_v1_h32ds(
     writes to the shared half-buffer; tilelang's thread-sync pass inserts
     the RAW/WAR barriers around each load/gemm pair.
     """
+    assert kv_dtype == "bfloat16", (
+        "the h32ds geometry does not fold quant scales; use v1-h16 or the "
+        "split-topk partial for fused fp8/NVFP4 pool reads (campaign-2 "
+        "task 12)"
+    )
     assert dim == tilelang.math.next_power_of_2(
         dim
     ), f"haven't check padding correctness yet, dim={dim}"
@@ -797,7 +921,9 @@ def sparse_attention_fwd_kernel_v1_h32ds(
             b_i, g_i = by, bz
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block)
+            H0 = g_i * padded_H + (
+                0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block
+            )
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, 0:DH], Q_shared_l)
@@ -980,12 +1106,18 @@ def sparse_attention_fwd_kernel_v1_h32p(
     exp2(-inf) = 0 in S, so their V contribution is 0 either way (writing 0
     instead of the index=-1 garbage row is strictly safer).
 
-    fp8 KV keeps the elementwise fp8->bf16 cast inside all three gathers.
-    Note cp.async cannot carry a dtype conversion, so on the fp8 path the
-    prefetch overlap relies on the pipeline's issue-order (ld.global for
-    tile i+2 issued before tile i's gemms) rather than hardware async
-    copies; the bf16 path can additionally be lowered to cp.async.
+    fp8/NVFP4 KV is not folded here (bf16 only; fused dequant-in-gather lives
+    in v1-h16 and the split-topk partial, campaign-2 task 12). Note cp.async
+    cannot carry a dtype conversion, so on an fp8 path the prefetch overlap
+    would rely on the pipeline's issue-order (ld.global for tile i+2 issued
+    before tile i's gemms) rather than hardware async copies; the bf16 path
+    can additionally be lowered to cp.async.
     """
+    assert kv_dtype == "bfloat16", (
+        "the h32p geometry does not fold quant scales; use v1-h16 or the "
+        "split-topk partial for fused fp8/NVFP4 pool reads (campaign-2 "
+        "task 12)"
+    )
     assert dim == tilelang.math.next_power_of_2(
         dim
     ), f"haven't check padding correctness yet, dim={dim}"
@@ -1085,7 +1217,9 @@ def sparse_attention_fwd_kernel_v1_h32p(
             b_i, g_i = by, bz
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block)
+            H0 = g_i * padded_H + (
+                0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block
+            )
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, 0:DH], Q_shared_l)
@@ -1681,10 +1815,47 @@ def sparse_mla_fwd_decode_partial(
     dtype = T.bfloat16
     accum_dtype = T.float32
 
+    # Unified fused-dequant signature, same convention as the v1 kernel
+    # above (campaign-2 task 12): (KV, KV_nope, KV_scale, KV_rope, KV_rs)
+    # with 1-element dummies in the slots the active layout does not read.
+    d_n, d_s, d_r, d_x, d_z = T.dynamic("d_n, d_s, d_r, d_x, d_z")
+    _gs = 1.0
+    if kv_dtype == "bfloat16":
+        ann_kv = T.Tensor(kv_shape, kv_dtype)
+        ann_nope = T.Tensor([d_z], FP8)
+        ann_scale = T.Tensor([d_z], FP32)
+        ann_rope = T.Tensor([d_z], dtype)
+        ann_rs = T.Tensor([d_z], FP8)
+    elif kv_dtype == "float8_e4m3":
+        assert D % 128 == 0, "fp8 layout needs per-128-block scales"
+        ann_kv = T.Tensor([d_z], FP8)
+        ann_nope = T.StridedTensor([seq_len_kv, D], [d_n, 1], FP8)
+        ann_scale = T.StridedTensor([seq_len_kv, D // 128], [d_s, 1], FP32)
+        ann_rope = T.StridedTensor([seq_len_kv, D_tail], [d_r, 1], dtype)
+        ann_rs = T.Tensor([d_z], FP8)
+    elif kv_dtype == "nvfp4":
+        from sglang.srt.layers.attention.nsa.nvfp4_kv_cache import (
+            nvfp4_global_scale,
+        )
+
+        assert D % 16 == 0 and D_tail % 16 == 0, "nvfp4 needs per-16 blocks"
+        _gs = nvfp4_global_scale()
+        ann_kv = T.Tensor([d_z], FP8)
+        ann_nope = T.StridedTensor([seq_len_kv, D // 2], [d_n, 1], "uint8")
+        ann_scale = T.StridedTensor([seq_len_kv, D // 16], [d_s, 1], FP8)
+        ann_rope = T.StridedTensor([seq_len_kv, D_tail // 2], [d_r, 1], "uint8")
+        ann_rs = T.StridedTensor([seq_len_kv, D_tail // 16], [d_x, 1], FP8)
+    else:
+        raise ValueError(f"unsupported kv_dtype {kv_dtype!r}")
+
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),
-        KV: T.Tensor(kv_shape, kv_dtype),
+        KV: ann_kv,
+        KV_nope: ann_nope,
+        KV_scale: ann_scale,
+        KV_rope: ann_rope,
+        KV_rs: ann_rs,
         Indices: T.Tensor(indices_shape, indices_dtype),
         Partial_O: T.Tensor(partial_o_shape, dtype),
         Partial_Lse: T.Tensor(partial_lse_shape, accum_dtype),
@@ -1721,21 +1892,58 @@ def sparse_mla_fwd_decode_partial(
             # Clamp the gather index (same idiom as v1): production index
             # pages are padded with -1, which would otherwise read out of
             # bounds. The masked row above contributes exp2(-inf) = 0 either
-            # way, so clamping to row 0 is numerically inert.
-            for bi_i, d_i in T.Parallel(BI, D):
-                KV_shared[bi_i, d_i] = KV[
-                    b_i,
-                    T.max(Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], 0),
-                    g_i,
-                    d_i,
-                ]
-            for bi_i, d_i in T.Parallel(BI, D_tail):
-                K_tail_shared[bi_i, d_i] = KV[
-                    b_i,
-                    T.max(Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], 0),
-                    g_i,
-                    D + d_i,
-                ]
+            # way, so clamping to row 0 is numerically inert. The fused
+            # quant layouts read scales/packed bytes from the same clamped
+            # row (see the v1 gather for the layout details).
+            if kv_dtype == "bfloat16":
+                for bi_i, d_i in T.Parallel(BI, D):
+                    KV_shared[bi_i, d_i] = KV[
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], 0),
+                        g_i,
+                        d_i,
+                    ]
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    K_tail_shared[bi_i, d_i] = KV[
+                        b_i,
+                        T.max(Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], 0),
+                        g_i,
+                        D + d_i,
+                    ]
+            elif kv_dtype == "float8_e4m3":
+                for bi_i, d_i in T.Parallel(BI, D):
+                    row_i = T.max(Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], 0)
+                    KV_shared[bi_i, d_i] = (
+                        KV_nope[row_i, d_i].astype(FP32) * KV_scale[row_i, d_i // 128]
+                    ).astype(dtype)
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    row_i = T.max(Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], 0)
+                    K_tail_shared[bi_i, d_i] = KV_rope[row_i, d_i]
+            else:  # kv_dtype == "nvfp4"
+                for bi_i, d_i in T.Parallel(BI, D):
+                    row_i = T.max(Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], 0)
+                    KV_shared[bi_i, d_i] = (
+                        _e2m1_decode_tl(
+                            (
+                                KV_nope[row_i, d_i // 2].astype("int32")
+                                >> ((d_i & 1) * 4)
+                            )
+                            & 15
+                        )
+                        * (KV_scale[row_i, d_i // 16].astype(FP32) * _gs)
+                    ).astype(dtype)
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    row_i = T.max(Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], 0)
+                    K_tail_shared[bi_i, d_i] = (
+                        _e2m1_decode_tl(
+                            (
+                                KV_rope[row_i, d_i // 2].astype("int32")
+                                >> ((d_i & 1) * 4)
+                            )
+                            & 15
+                        )
+                        * (KV_rs[row_i, d_i // 16].astype(FP32) * _gs)
+                    ).astype(dtype)
             for h_i, bi_i in T.Parallel(H_per_block, BI):
                 acc_s[h_i, bi_i] = T.if_then_else(
                     mask[bi_i], 0, -T.infinity(acc_s.dtype)
@@ -1894,13 +2102,105 @@ def _nsa_tilelang_geom() -> str:
             f"alpha); supported values: {_NSA_TILELANG_GEOM_WORKING}."
         )
     if geom not in _NSA_TILELANG_GEOM_WORKING:
-        logger.warning(
-            "Unknown SGLANG_NSA_TILELANG_GEOM=%r, falling back to h16", geom
-        )
+        logger.warning("Unknown SGLANG_NSA_TILELANG_GEOM=%r, falling back to h16", geom)
         geom = "h16"
     if geom != "h16":
         logger.info("NSA tilelang sparse-fwd smem geometry: %s", geom)
     return geom
+
+
+@functools.cache
+def nsa_tilelang_fused_dequant_supported() -> bool:
+    """True when the fused dequant-in-gather sparse-fwd kernels (fp8/NVFP4
+    pool rows with scales folded into the gather, campaign-2 task 12) are
+    available on this device. Only the sm_120 v1/split-topk tilelang path
+    folds scales; Hopper keeps v2 (dense bf16) and HIP is unvalidated, so
+    both must keep the legacy dequant hop.
+    """
+    if _is_hip:
+        return False
+    try:
+        import torch as _t
+
+        return _t.cuda.get_device_capability()[0] >= 12
+    except Exception:
+        return False
+
+
+def _nsa_kv_layout(kv: torch.Tensor, d_v: int, tail_dim: int) -> str:
+    """Classify a KV pool row layout from its row bytes: "bfloat16" (dense
+    bf16), "float8_e4m3" (fp8 + per-128-block f32 scales + raw bf16 rope) or
+    "nvfp4" (packed e2m1 + per-16 fp8 scales). The fp8 and NVFP4 pools are
+    both float8_e4m3fn-typed byte buffers, so the row size disambiguates.
+    """
+    if kv.dtype != torch.float8_e4m3fn:
+        return "bfloat16"
+    from sglang.srt.layers.attention.nsa.nvfp4_kv_cache import nvfp4_row_bytes
+
+    fp8_bytes = d_v + (d_v // 128) * 4 + tail_dim * 2  # 512 + 16 + 128 = 656
+    if kv.shape[-1] == fp8_bytes:
+        return "float8_e4m3"
+    if kv.shape[-1] == nvfp4_row_bytes(d_v, tail_dim):  # 328
+        return "nvfp4"
+    raise ValueError(
+        f"unrecognized fp8 KV pool row size {kv.shape[-1]} "
+        f"(expected {fp8_bytes} for fp8 or {nvfp4_row_bytes(d_v, tail_dim)} "
+        "for NVFP4)"
+    )
+
+
+@functools.cache
+def _fused_slot_dummy(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Cached 1-element placeholder for the unified fused-dequant signature
+    slots the active layout does not read. Never touched by the compiled
+    kernel; cached so CUDA-graph capture sees a fixed address."""
+    return torch.empty(1, device=device, dtype=dtype)
+
+
+def _nsa_fused_kv_args(kv: torch.Tensor, kv_dtype: str, d_v: int, tail_dim: int):
+    """Build the (KV, KV_nope, KV_scale, KV_rope, KV_rs) argument tuple for
+    the unified fused-dequant signature of sparse_attention_fwd_kernel_v1
+    and sparse_mla_fwd_decode_partial. Strided 2D views alias the pool rows
+    (no copy); unused slots get a cached 1-element dummy. Capture-safe:
+    views + cached tensors only.
+    """
+    if kv_dtype == "bfloat16":
+        return (
+            kv,
+            _fused_slot_dummy(kv.device, FP8_),
+            _fused_slot_dummy(kv.device, torch.float32),
+            _fused_slot_dummy(kv.device, torch.bfloat16),
+            _fused_slot_dummy(kv.device, FP8_),
+        )
+    row_bytes = kv.shape[-1]
+    if kv_dtype == "float8_e4m3":
+        # Row layout (656B): fp8 nope [0,512) | 4 x f32 scales [512,528) |
+        # bf16 rope [528,656). See nsa/quant_k_cache.py.
+        kv2 = kv.view(-1, row_bytes)
+        kv_nope = kv2[:, :d_v]
+        kv_scale = kv2[:, d_v : d_v + (d_v // 128) * 4].view(torch.float32)
+        kv_rope = kv2[:, d_v + (d_v // 128) * 4 :].view(torch.bfloat16)
+        return (
+            _fused_slot_dummy(kv.device, FP8_),
+            kv_nope,
+            kv_scale,
+            kv_rope,
+            _fused_slot_dummy(kv.device, FP8_),
+        )
+    # nvfp4 row layout (328B): packed e2m1 nope (256B) | fp8 nope scales
+    # (32B) | packed e2m1 rope (32B) | fp8 rope scales (4B) | pad (4B).
+    # See nsa/nvfp4_kv_cache.py.
+    kv2u8 = kv.view(torch.uint8).view(-1, row_bytes)
+    kv2f8 = kv.view(-1, row_bytes)
+    nq, ns = d_v // 2, d_v // 16
+    rq, rs = tail_dim // 2, tail_dim // 16
+    return (
+        _fused_slot_dummy(kv.device, FP8_),
+        kv2u8[:, :nq],
+        kv2f8[:, nq : nq + ns],
+        kv2u8[:, nq + ns : nq + ns + rq],
+        kv2f8[:, nq + ns + rq : nq + ns + rq + rs],
+    )
 
 
 def tilelang_sparse_fwd(
@@ -1922,33 +2222,67 @@ def tilelang_sparse_fwd(
     if _is_hip or _small_smem:
         # v2's tiles need ~226KB dynamic smem (Hopper/SM100). sm_120 workstation
         # Blackwell caps at ~99KB per block; v1 with num_stages=1 fits.
-        kv_dtype = "float8_e4m3" if kv.dtype == torch.float8_e4m3fn else "bfloat16"
-        assert kv_dtype == "bfloat16", (
-            "fp8 pool read without per-128-block scale folding is numerically wrong; "
-            "dequantize first or implement scale folding (campaign-2 Task 12)"
-        )
+        kv_dtype = _nsa_kv_layout(kv, d_v, tail_dim)
+        if _is_hip:
+            # Fused scale folding is validated on sm_120 only; HIP keeps the
+            # task-3 tripwire (dequantize first, SGLANG_NSA_DEQUANT_HOP=1).
+            assert kv_dtype == "bfloat16", (
+                "fp8 pool read without per-128-block scale folding is "
+                "numerically wrong; dequantize first (campaign-2 Task 12)"
+            )
         # Optional sm_120 smem-geometry override (see table above the h32
         # kernels): h16 (default, current path) | h32 | h32ds | h32p.
         geom = _nsa_tilelang_geom() if _small_smem else "h16"
+        if geom == "h16":
+            kernel = sparse_attention_fwd_kernel_v1(
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                num_stages=1,
+                threads=128,
+                kv_dtype=kv_dtype,
+            )
+            return kernel(
+                q.unsqueeze(0),
+                *_nsa_fused_kv_args(kv, kv_dtype, d_v, tail_dim),
+                indices.unsqueeze(0),
+            )  # type: ignore
+        # The experimental h32/h32ds/h32p geometries do NOT fold quant
+        # scales; keep the task-3 tripwire for them (use h16 for fused
+        # fp8/NVFP4 reads, or SGLANG_NSA_DEQUANT_HOP=1 for the legacy hop).
+        assert kv_dtype == "bfloat16", (
+            f"SGLANG_NSA_TILELANG_GEOM={geom} does not fold quant scales; "
+            "fp8/NVFP4 pool reads require h16 (fused, default) or the "
+            "legacy dequant hop (SGLANG_NSA_DEQUANT_HOP=1)"
+        )
         if geom == "h32":
             kernel = sparse_attention_fwd_kernel_v1_h32(
-                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale,
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
                 kv_dtype=kv_dtype,
             )
         elif geom == "h32ds":
             kernel = sparse_attention_fwd_kernel_v1_h32ds(
-                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale,
-                kv_dtype=kv_dtype,
-            )
-        elif geom == "h32p":
-            kernel = sparse_attention_fwd_kernel_v1_h32p(
-                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale,
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
                 kv_dtype=kv_dtype,
             )
         else:
-            kernel = sparse_attention_fwd_kernel_v1(
-                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1,
-                threads=128, kv_dtype=kv_dtype,
+            kernel = sparse_attention_fwd_kernel_v1_h32p(
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                kv_dtype=kv_dtype,
             )
     else:
         kernel = sparse_attention_fwd_kernel_v2(
@@ -1968,7 +2302,8 @@ def tilelang_sparse_fwd_split_topk(
     index blocks across (seq_len*4, 32) = 128 CTAs (vs the single-pass
     kernel's 4), each writing bf16 partials; a combine pass then merges the 32
     splits per head. Same interface and output shape as tilelang_sparse_fwd.
-    bf16 KV only (fp8 pool folding is campaign-2 Task 12).
+    Accepts bf16 KV or fp8/NVFP4 pool rows (fused dequant-in-gather with
+    folded scales, campaign-2 task 12).
     """
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
@@ -1976,17 +2311,20 @@ def tilelang_sparse_fwd_split_topk(
     tail_dim = dim - d_v
     topk = indices.shape[-1]
     assert topk == 2048
-    kv_dtype = "float8_e4m3" if kv.dtype == torch.float8_e4m3fn else "bfloat16"
-    assert kv_dtype == "bfloat16", (
-        "fp8 pool read without per-128-block scale folding is numerically wrong; "
-        "dequantize first or implement scale folding (campaign-2 Task 12)"
-    )
+    kv_dtype = _nsa_kv_layout(kv, d_v, tail_dim)
     partial = sparse_mla_fwd_decode_partial(
-        num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, kv_dtype=kv_dtype,
+        num_heads,
+        d_v,
+        tail_dim,
+        topk,
+        sm_scale=sm_scale,
+        kv_dtype=kv_dtype,
     )
     combine = sparse_mla_fwd_decode_combine(num_heads, d_v, topk, head_per_block=16)
     partial_o, partial_lse = partial(
-        q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
+        q.unsqueeze(0),
+        *_nsa_fused_kv_args(kv, kv_dtype, d_v, tail_dim),
+        indices.unsqueeze(0),
     )
     return combine(partial_o, partial_lse)
 
