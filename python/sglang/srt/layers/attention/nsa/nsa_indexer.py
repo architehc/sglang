@@ -93,8 +93,47 @@ _NSA_TWO_PASS_TOPK = (
 )
 
 
+_INDEXER_DUMP_N = 0
+
+
+def _maybe_dump_indexer_call(q, kv, weights, ks, ke):
+    """Research hook (SGLANG_INDEXER_DUMP=dir): persist real deep-prefill
+    indexer inputs — full K rows + 64 sampled query rows — for offline
+    selection studies. Only calls with L > 150k keys, max 25 dumps."""
+    global _INDEXER_DUMP_N
+    import os
+
+    d = os.environ.get("SGLANG_INDEXER_DUMP")
+    if not d or _INDEXER_DUMP_N >= 25:
+        return
+    k_fp8, k_scale = kv
+    L = k_fp8.shape[0]
+    if L < 150_000:
+        return
+    import torch
+
+    rows = q.shape[0]
+    idx = torch.randperm(rows, device=q.device)[:64].sort().values
+    _INDEXER_DUMP_N += 1
+    os.makedirs(d, exist_ok=True)
+    torch.save(
+        {
+            "k_fp8": k_fp8.view(torch.uint8).cpu(),
+            "k_scale": k_scale.float().cpu(),
+            "q_fp8": q[idx].view(torch.uint8).cpu(),
+            "weights": weights[idx].float().cpu(),
+            "ks": ks[idx].cpu(),
+            "ke": ke[idx].cpu(),
+            "L": L,
+            "rows_sampled": idx.cpu(),
+        },
+        os.path.join(d, f"indexer_call_{_INDEXER_DUMP_N:03d}_L{L}.pt"),
+    )
+
+
 def _dispatch_fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=True):
     global _SM120_MQA_IMPL
+    _maybe_dump_indexer_call(q, kv, weights, ks, ke)
     if _use_torch_mqa_logits():
         # Probe the Triton kernel once; afterwards genuine runtime failures
         # (OOM, illegal access) propagate instead of silently degrading to the
