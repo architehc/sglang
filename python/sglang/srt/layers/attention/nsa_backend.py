@@ -98,6 +98,12 @@ _NSA_DEQUANT_HOP = envs.SGLANG_NSA_DEQUANT_HOP.get()
 # Launch-time toggle, frozen at import. Default OFF.
 _NSA_TRITON_TOPK = envs.SGLANG_NSA_TRITON_TOPK.get()
 
+# Decode/verify row-count discriminator shared by the tilelang decode
+# fast paths below (_fast_topk_v2_compat, the fp8/NVFP4 dequant hops and
+# the split-topk route in _forward_tilelang): at most this many q rows
+# means decode/verify shapes; anything larger is a prefill chunk.
+_NSA_DECODE_MAX_ROWS = 64
+
 
 def _scope_prefill_pool_rows(
     kv_cache: torch.Tensor, seq_lens_cpu: Optional[torch.Tensor]
@@ -197,9 +203,9 @@ def _fast_topk_v2_compat(score, lengths, topk, row_starts=None, prewindowed=Fals
 
     # Decode/verify shapes only: the Triton kernel is tuned for the
     # single-row decode case; at prefill row counts (up to 32k) it runs
-    # pathologically. Mirror the split-topk discriminator in
-    # _forward_tilelang (q_all.shape[0] <= 64); score is [q_rows, L].
-    if _NSA_TRITON_TOPK and score.shape[0] <= 64:
+    # pathologically. Shares the _NSA_DECODE_MAX_ROWS discriminator with
+    # the split-topk route in _forward_tilelang; score is [q_rows, L].
+    if _NSA_TRITON_TOPK and score.shape[0] <= _NSA_DECODE_MAX_ROWS:
         from sglang.srt.layers.attention.nsa.triton_topk import (
             triton_topk_supports,
             triton_topk_v2,
@@ -2097,7 +2103,7 @@ class NativeSparseAttnBackend(
                 dequantize_k_cache_nvfp4_paged,
             )
 
-            if q_all.shape[0] <= 64:
+            if q_all.shape[0] <= _NSA_DECODE_MAX_ROWS:
                 # Decode/verify: fused gather+dequant of ONLY the top-k rows
                 # (q_rows x 2048 x 328B) directly from the paged pool, then
                 # remap page_table_1 to local row indices (same trick as the
@@ -2124,7 +2130,7 @@ class NativeSparseAttnBackend(
                 dequantize_k_cache,
             )
 
-            if q_all.shape[0] <= 64:
+            if q_all.shape[0] <= _NSA_DECODE_MAX_ROWS:
                 # Decode/verify: fused gather+dequant of ONLY the top-k rows
                 # (q_rows x 2048 x 656B, ~1-100MB) directly from the paged
                 # pool, instead of the whole pool (~0.5GB per layer per
@@ -2145,7 +2151,7 @@ class NativeSparseAttnBackend(
                     _scope_prefill_pool_rows(kv_cache, seq_lens_cpu)
                 )
 
-        if q_all.shape[0] <= 64 and _NSA_SPLIT_TOPK:
+        if q_all.shape[0] <= _NSA_DECODE_MAX_ROWS and _NSA_SPLIT_TOPK:
             # Decode/verify only: split the 2048-row topk across 128 CTAs
             # (partial) + a combine pass. Prefill (nq>64) must not route
             # here: partial traffic would scale with token count.

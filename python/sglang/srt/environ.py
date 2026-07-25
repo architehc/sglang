@@ -412,11 +412,13 @@ class Envs:
     SGLANG_NSA_TRITON_TOPK = EnvBool(False)
     # Force the legacy dequant hop (gather+dequant of the top-k pool rows
     # into a bf16 buffer + arange/where local index remap) before the
-    # tilelang NSA attention kernels, instead of the default fused
-    # dequant-in-gather read of fp8/NVFP4 pool rows (sm_120, campaign-2 task
-    # 12). A/B escape hatch; the fused path is numerics-equivalent. Default
-    # OFF (fused). Ignored off sm_120, where the hop is always kept.
-    SGLANG_NSA_DEQUANT_HOP = EnvBool(False)
+    # tilelang NSA attention kernels, instead of the fused dequant-in-gather
+    # read of fp8/NVFP4 pool rows (sm_120, campaign-2 task 12). The fused
+    # path is numerics-equivalent but measured SLOWER in the production A/B
+    # (037b85c-era), so the hop is the default and every profile pins =1;
+    # fused stays as an opt-in escape hatch via =0. Ignored off sm_120,
+    # where the hop is always kept.
+    SGLANG_NSA_DEQUANT_HOP = EnvBool(True)
     # Exact two-pass (block-max) topk for NSA ragged prefill on sm_120
     # (campaign-2 task 13 part 2). Pass 1 emits per-128-key block maxes from
     # the MQA logits kernel instead of the full [rows, L] fp32 logits; the
